@@ -72,6 +72,23 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   `cmake -S . -B build -G Ninja && cmake --build build`
 - Generated files are gitignored: `src/recomp/gen/`, `src/runtime/imports_gen.c`.
 
+## Bring-up State (Phase 7)
+- 32 of 171 imports have real bodies in `src/runtime/shims_impl.c`; the rest log
+  once and return 0. Add a name to `HAND_WRITTEN` in gen_imports.py AND write the
+  body — the generator fails if one exists without the other.
+- **gen_imports.py verifies every hand-written shim's STDRET against the derived
+  count on each run.** Never hand-tune a STDRET to "make it work".
+- **Build sets `RECOMP_RETADDR=0u`** as a MITIGATION, not a fix: a stack
+  imbalance during CRT startup leaks the dummy return address into an out-pointer
+  argument at `sub_0056E9D0`. The callee null-checks, so 0 is inert. Finding the
+  real argument-count mismatch is open work — then restore a poisoned value.
+- **Current blocker: no FS segment / TEB.** `sub_0056EED8` installs the CRT's SEH
+  frame via `fs:[0]`; `g_fs_base` is 0 so it reads the null page. Fix: allocate a
+  TEB-shaped block in the arena, point `g_fs_base` at it. We never dispatch SEH,
+  so the chain just needs to be writable memory.
+- Debugging: `-DRECOMP_TRACE` gives the function-entry ring buffer; the crash
+  handler prints `g_cur_func`, registers, ICALL history, and region names.
+
 ## Upstream Bugs Found And Fixed (pcrecomp)
 1. `lift32.FUNCTION_LOCALS` — the lifter/driver locals contract existed nowhere;
    each driver's hand-copied preamble went stale when `_flag_k` was added.
@@ -86,9 +103,20 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
    from file offset 0 out of a 1.9 MB buffer, over the BSS. Now tests
    `PointerToRawData == 0` and clamps the copy to the file and the mapped span.
 
+5. `runtime/recomp32/crash_report.{c,h}` — the VEH crash reporter was trapped
+   inside an XWA-specific `main.c`. Now standalone, reports `g_cur_func`, and
+   takes a region-describer callback so bad pointers print their region.
+
 Also found: the sibling projects' hand-typed import ARGC table gives
 `waveOutOpen` 7 args; the SDK decoration says 6. Not fixed there — noted as the
 reason this project derives the counts instead.
+
+## Upstreamed Tooling (use these, don't re-copy)
+- `pcrecomp/tools/pe/stdcall_argc.py` — `ArgcResolver` derives stdcall arg counts
+  from SDK import libs; resolves ordinals via the system DLL. `--selftest`.
+- `pcrecomp/tools/lift/recover.py` — `recover_functions()`, the missing-function
+  and alternate-entry scan shared by all lift drivers. `--selftest`.
+- `pcrecomp/runtime/recomp32/crash_report.{c,h}` — crash diagnostics.
 
 ## Current Numbers (Phase 3, 2026-09-09)
 - 5,494 functions (673 FLIRT library, 190 thunks, 39 no-return), 1.46 MB code

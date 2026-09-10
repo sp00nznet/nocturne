@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(_pc, 'lift'))
 
 from pe_analyze import analyze_pe, build_iat_map
 from lift32 import Lifter, FUNCTION_LOCALS
+from recover import recover_functions
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 from capstone.x86 import X86_OP_IMM
 
@@ -51,7 +52,7 @@ HOST_SHIM = set()
 # FORCE_RECOVER: extra entries that overlap an existing body and must be lifted
 # anyway. The common case -- a direct `call` to a mid-body address, i.e. an
 # alternate entry point IDA merged away -- is now detected automatically in
-# _recover_missing_funcs, so this stays EMPTY. Add a VA here only for one the
+# pcrecomp's recover.py, so this stays EMPTY. Add a VA here only for one the
 # scan cannot see, e.g. a target reached solely through a computed jump.
 FORCE_RECOVER = set()
 FPU_CMP = {'EQ':'==','NE':'!=','B':'<','BE':'<=','A':'>','AE':'>=',
@@ -157,105 +158,6 @@ def write_chunk(out, idx, funcs):
         for code,_,_ in funcs: f.write(code+'\n\n')
 
 
-_COND_J = {'je','jne','jz','jnz','ja','jae','jb','jbe','jg','jge','jl','jle','js','jns',
-           'jo','jno','jp','jnp','jcxz','jecxz','loop','loope','loopne'}
-
-def _recover_missing_funcs(code_data, cs, ce, ida_fns):
-    """Find functions IDA missed because they're reached only via jmp-thunk
-    chains / tail calls. Returns a list of (start, end) not already covered.
-
-    Strategy: (1) scan every known function body for direct jmp/call immediates
-    that land outside all known functions -- those are missed entries; (2) decode
-    each such seed by recursive descent (following its intra jumps and harvesting
-    its own external tail-call/thunk targets) to a fixpoint, computing exact
-    [start,end) bounds. code_data is indexed by (va - cs)."""
-    import bisect
-    md = Cs(CS_ARCH_X86, CS_MODE_32); md.detail = True
-    fns = sorted(ida_fns)
-    starts = [a for a,_ in fns]; entries = {a for a,_ in fns}
-    def covered(a):
-        i = bisect.bisect_right(starts, a) - 1
-        return i >= 0 and fns[i][0] <= a < fns[i][1]
-    def imm_of(ins):
-        ops = ins.operands
-        if ops and ops[0].type == X86_OP_IMM:
-            return ops[0].imm & 0xFFFFFFFF
-        return None
-    def slice_at(va, n=2048):
-        o = va - cs
-        return code_data[o:o+n] if 0 <= o < len(code_data) else b''
-
-    # Pass 1: seed set = uncovered direct jmp/call targets from known bodies,
-    # PLUS code-address immediates (function pointers assigned via `mov [mem], imm`
-    # / `push imm` -- e.g. the span-renderer callbacks stored to dword_4EBD28 like
-    # sub_406FDA, which IDA missed and which have no direct call). The recursive
-    # decode in Pass 2 validates each seed, so a stray data immediate that happens
-    # to look like a code address just decodes to dead (never-called) code.
-    #
-    # Pass 1b, in the same sweep: a direct `call` to an address that IS covered by
-    # a known body but is not that body's entry is an *alternate entry point* --
-    # IDA merged what were several small routines into one function. The CPU will
-    # execute from there, so it needs its own lifted body; without one the lifter
-    # emits RECOMP_CALL(sub_<addr>) for a function nobody defines and the build
-    # dies at link time with an unresolved external. Only `call` counts: a `jmp`
-    # into a covered range is ordinary intra-function control flow.
-    seeds = set()
-    alt_entries = set()
-    for ea, end in fns:
-        for ins in md.disasm(slice_at(ea, end-ea), ea):
-            if ins.mnemonic in ('jmp','call'):
-                t = imm_of(ins)
-                if t is not None and cs <= t < ce and t not in entries:
-                    if not covered(t):
-                        seeds.add(t)
-                    elif ins.mnemonic == 'call':
-                        alt_entries.add(t)
-            for op in (ins.operands or []):
-                if op.type == X86_OP_IMM:
-                    t = op.imm & 0xFFFFFFFF
-                    if cs <= t < ce and t not in entries and not covered(t):
-                        seeds.add(t)
-
-    # Pass 2: recursively recover each seed (+ targets it reaches) to a fixpoint.
-    recovered = {}
-    forced = {s for s in (set(FORCE_RECOVER) | alt_entries)
-              if cs <= s < ce and s not in entries}
-    work = list(seeds) + list(forced)
-    while work:
-        s = work.pop()
-        # Forced entries are allowed to overlap an existing body (covered()); normal
-        # seeds are not.
-        if s in recovered or (covered(s) and s not in forced):
-            continue
-        visited = set(); blocks = [s]; maxend = s
-        while blocks:
-            va = blocks.pop()
-            if va in visited:
-                continue
-            for ins in md.disasm(slice_at(va), va):
-                if ins.address in visited:
-                    break
-                visited.add(ins.address); maxend = max(maxend, ins.address + ins.size)
-                m = ins.mnemonic; t = imm_of(ins)
-                if m == 'call':
-                    if t is not None and cs <= t < ce and t not in entries and not covered(t):
-                        work.append(t)
-                    continue
-                if m == 'jmp':
-                    if t is not None:
-                        if s <= t < s + 0x4000 and not covered(t):
-                            blocks.append(t)                 # intra-function jump
-                        elif cs <= t < ce and t not in entries and not covered(t):
-                            work.append(t)                    # tail call / thunk target
-                    break
-                if m in _COND_J:
-                    if t is not None and s <= t < s + 0x4000 and not covered(t):
-                        blocks.append(t)
-                    continue
-                if m in ('ret','retn','retf','iret','int3'):
-                    break
-        recovered[s] = maxend
-    return sorted(recovered.items())
 
 
 def main():
@@ -288,17 +190,16 @@ def main():
     fns.sort()
     print(f'[*] seeded {len(fns)} functions from IDA catalog (with exact bounds)')
 
-    # IDA's analysis misses functions reached *only* via jmp-thunk chains / tail
-    # calls (no direct CALL, no standard prologue) -- e.g. a thunk `jmp X` whose
-    # target X starts with `cmp`. At runtime these surface as `ITAIL: unresolved
-    # VA ...` and stall the game. Recover them here: scan every IDA function body
-    # for direct jmp/call targets that land outside all known functions, then
-    # recursively decode each such target (following its own tail calls/thunks)
-    # to a fixpoint, computing exact [start,end) bounds. Union the result in.
-    missing=_recover_missing_funcs(code_data, cs, ce, fns)
+    # IDA's catalog misses two kinds of entry point: functions reached only via
+    # jmp-thunk chains / tail calls / stored function pointers, and alternate
+    # entry points inside a body it merged. The first stall at runtime with
+    # `ITAIL: unresolved VA ...`; the second break the *build*, since the lifter
+    # emits a call to a function nobody defines. pcrecomp's recover module finds
+    # both -- see tools/lift/recover.py.
+    missing = recover_functions(code_data, cs, ce, fns, forced=FORCE_RECOVER)
     if missing:
         fns.extend(missing); fns.sort()
-        print(f'[*] recovered {len(missing)} functions IDA missed (thunk/tail-call targets): '
+        print(f'[*] recovered {len(missing)} functions IDA missed (thunks, tail calls, alt entries): '
               + ', '.join(f'0x{a:08X}' for a,_ in missing[:8]) + (' ...' if len(missing)>8 else ''))
 
     md=Cs(CS_ARCH_X86, CS_MODE_32); md.detail=True

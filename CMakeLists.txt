@@ -31,7 +31,9 @@ add_executable(nocturne_recomp
   ${GEN_SOURCES}
   src/runtime/imports_gen.c
   src/runtime/recomp_runtime.c
+  src/runtime/shims_impl.c
   "${PCRECOMP}/runtime/recomp32/image_loader.c"
+  "${PCRECOMP}/runtime/recomp32/crash_report.c"
 )
 
 target_include_directories(nocturne_recomp PRIVATE
@@ -39,6 +41,20 @@ target_include_directories(nocturne_recomp PRIVATE
   src/runtime                          # imports.h
   "${PCRECOMP}/runtime/recomp32"       # image_loader.h
 )
+
+# The dummy return address RECOMP_CALL pushes. It defaults to 0xDEAD0000, which
+# is easy to spot in a register dump -- and destructive the moment a stack
+# imbalance leaks it into a value, because code then writes through it.
+#
+# Nocturne has such a leak during Watcom CRT startup: a routine that takes two
+# optional out-pointers reads its second argument off the stack and gets the
+# marker, then stores through it. The routine null-checks both pointers, so with
+# the marker set to 0 the leak is inert and bring-up continues past it.
+#
+# This is a mitigation, not a fix -- recomp_types.h documents it for exactly this
+# situation. The imbalance itself is still open; see docs/PHASE7.md.
+set(RECOMP_RETADDR "0u" CACHE STRING "Dummy return address pushed by RECOMP_CALL")
+target_compile_definitions(nocturne_recomp PRIVATE RECOMP_RETADDR=${RECOMP_RETADDR})
 
 if(MSVC)
   # 885,000 lines of generated C: /MP is the difference between a coffee and a

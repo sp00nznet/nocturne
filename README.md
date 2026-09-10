@@ -53,7 +53,12 @@ by `tools/pod.py`.
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
-| 7 | Bring-up — real shim bodies → WinMain → window → POD mount → menu | ⬜ next |
+| 7 | Bring-up — 32 real shims, CRT runs to SEH install | 🟡 in progress |
+
+Bring-up now gets the Watcom CRT through its heap, its stack-limit discovery,
+and `argv`/`environ`, stopping where it installs a structured exception handler
+through `fs:[0]` — the runtime has no TEB yet. 32 of 171 imports have real
+bodies. See **[docs/PHASE7.md](docs/PHASE7.md)**.
 
 "It runs" means the CRT's opening moves execute correctly. It is not the same as
 playable: every shim is a stub, nothing renders, no POD is mounted. See

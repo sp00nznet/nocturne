@@ -8,105 +8,52 @@ C shim per import plus a {iat_va -> shim} bridge table the runtime installs.
 Every shim must be stdcall-correct: it pops the dummy return address plus
 exactly the right number of argument slots. That count is not cosmetic. Get it
 wrong and the simulated stack silently desynchronises, so every value read after
-that call is garbage -- and the symptom shows up nowhere near the cause. The
-sibling projects kept the counts in a hand-typed table of a few hundred entries,
-which is a lot of chances to mistype a number that fails silently.
+that call is garbage -- and the symptom shows up nowhere near the cause.
 
-So we don't type them. The Windows SDK's 32-bit import libraries already carry
-the answer: stdcall exports are decorated `_Name@N`, where N is the argument
-byte count, straight from the header the API was compiled against. We read the
-counts out of the .lib files and refuse to emit anything we could not resolve.
-
-Ordinal-only imports (Nocturne pulls DirectSound in by ordinal) are resolved
-against the system DLL's export table first, then looked up by name.
+So we don't type them. `pcrecomp/tools/pe/stdcall_argc.py` derives every count
+from the decoration (`_Name@N`) in the Windows SDK's 32-bit import libraries,
+and resolves ordinal-only imports (Nocturne pulls DirectSound in by ordinal)
+against the system DLL's export table. This script just refuses to emit anything
+the resolver could not derive.
 
 Output: src/runtime/imports_gen.c
 """
 import collections
-import glob
-import os
 import re
+import os
 import sys
 
 _here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_here, '..', 'tools', 'tools', 'pe'))
 from pe_analyze import analyze_pe, build_iat_map
+from stdcall_argc import ArgcResolver
 
-SDK_GLOB = r"C:\Program Files (x86)\Windows Kits\10\Lib\*\um\x86"
-SYSTEM32 = r"C:\Windows\SysWOW64"
-DECORATED = re.compile(rb'_([A-Za-z_][A-Za-z0-9_]*)@(\d+)')
-
-# Imports that are genuinely not stdcall-decorated in any .lib, with the reason.
-# Keep this empty unless something really cannot be derived -- a hand-written
-# number here is exactly the failure mode this script exists to avoid.
-MANUAL_ARGC = {}
-
-
-def sdk_lib_dir():
-    """Newest installed 32-bit SDK lib directory."""
-    dirs = sorted(glob.glob(SDK_GLOB))
-    if not dirs:
-        raise SystemExit("no 32-bit Windows SDK lib directory found under "
-                         + SDK_GLOB)
-    return dirs[-1]
-
-
-def argc_from_lib(libdir, dll):
-    """Map exported name -> argument slot count, from the DLL's import library.
-
-    The decoration is a *byte* count, so 4 bytes per 32-bit slot.
-    """
-    path = os.path.join(libdir, os.path.splitext(dll)[0] + ".lib")
-    if not os.path.exists(path):
-        return {}
-    data = open(path, "rb").read()
-    out = {}
-    for m in DECORATED.finditer(data):
-        out[m.group(1).decode()] = int(m.group(2)) // 4
-    return out
-
-
-def ordinal_names(dll):
-    """ordinal -> export name, read from the system copy of the DLL."""
-    path = os.path.join(SYSTEM32, dll)
-    if not os.path.exists(path):
-        return {}
-    try:
-        import pefile
-    except ImportError:
-        return {}
-    pe = pefile.PE(path, fast_load=True)
-    pe.parse_data_directories(
-        directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
-    if not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
-        return {}
-    return {e.ordinal: e.name.decode()
-            for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name}
-
-
-def resolve(iat):
-    """[(va, dll, import_name, real_name, argc)], plus the unresolved ones."""
-    libdir = sdk_lib_dir()
-    lib_cache, ord_cache = {}, {}
-    rows, unresolved = [], []
-
-    for va, (dll, name) in sorted(iat.items()):
-        if dll not in lib_cache:
-            lib_cache[dll] = argc_from_lib(libdir, dll)
-
-        real = name
-        m = re.fullmatch(r'ordinal_(\d+)', name)
-        if m:
-            if dll not in ord_cache:
-                ord_cache[dll] = ordinal_names(dll)
-            real = ord_cache[dll].get(int(m.group(1)), name)
-
-        argc = lib_cache[dll].get(real, MANUAL_ARGC.get(real))
-        if argc is None:
-            unresolved.append((va, dll, name, real))
-        else:
-            rows.append((va, dll, name, real, argc))
-    return rows, unresolved
+# Imports with real bodies in src/runtime/shims_impl.c. These get an extern
+# declaration instead of a stub; the bridge table still points at them, so
+# swapping a stub for a real body is a one-line change here.
+#
+# Names are checked against the import table below -- a typo would otherwise
+# leave the stub in place and look exactly like the shim not being called.
+HAND_WRITTEN = {
+    # Memory
+    'VirtualAlloc', 'VirtualFree', 'VirtualQuery',
+    # Process / thread identity
+    'GetModuleHandleA', 'GetCurrentThreadId', 'GetCurrentProcessId',
+    'GetCurrentThread', 'GetCurrentProcess', 'GetVersion', 'GetStdHandle',
+    # Synchronisation
+    'CreateEventA', 'CreateMutexA', 'SetEvent', 'ReleaseMutex',
+    'WaitForSingleObject', 'CloseHandle',
+    # TLS
+    'TlsAlloc', 'TlsFree', 'TlsGetValue', 'TlsSetValue',
+    # Critical sections
+    'InitializeCriticalSection', 'DeleteCriticalSection',
+    'EnterCriticalSection', 'LeaveCriticalSection',
+    # Errors
+    'GetLastError', 'SetLastError',
+    # Program identity / environment: what the CRT builds argv and environ from
+    'GetCommandLineA', 'GetCommandLineW', 'GetModuleFileNameA',
+    'GetModuleFileNameW', 'GetEnvironmentStrings', 'FreeEnvironmentStringsA',
+}
 
 
 HEADER = """/* Nocturne Recompilation - import bridge layer - AUTO-GENERATED */
@@ -136,6 +83,10 @@ def emit(rows, out_path):
         if real in seen:
             continue          # same export reached through two IAT slots
         seen.add(real)
+        if real in HAND_WRITTEN:
+            lines.append("extern void imp_%s(void);  /* %s!%s (%d args) "
+                         "- real body in shims_impl.c */" % (real, dll, real, argc))
+            continue
         lines.append("/* %s!%s  (%d args) */" % (dll, real, argc))
         lines.append("static void imp_%s(void) { IMPORT_STUB(\"%s\"); "
                      "RET(0); STDRET(%d); }" % (real, real, argc))
@@ -160,6 +111,48 @@ def emit(rows, out_path):
     open(out_path, "w").write("\n".join(lines) + "\n")
 
 
+def check_hand_written(rows, shims_path):
+    """Verify each hand-written shim pops what the derived count says it should.
+
+    Deriving 171 argument counts and then hand-typing STDRET in the shim bodies
+    would put the mistake straight back where it was taken from -- and a wrong
+    STDRET fails silently, desynchronising the simulated stack so that the dummy
+    return address leaks into a register and the crash lands somewhere unrelated.
+    So the two are checked against each other on every generate.
+    """
+    if not os.path.exists(shims_path):
+        return
+    derived = {real: argc for _, _, _, real, argc in rows}
+    src = open(shims_path, encoding='utf-8').read()
+    # Bound each body by the start of the next definition, so one-line shims
+    # sitting on consecutive lines don't run together.
+    starts = [(m.start(), m.group(1))
+              for m in re.finditer(r'void imp_(\w+)\(void\)\s*\{', src)]
+    problems = []
+    for i, (pos, name) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(src)
+        found = {int(x) for x in re.findall(r'STDRET\((\d+)\)', src[pos:end])}
+        want = derived.get(name)
+        if want is None:
+            problems.append("%s: defined but not imported by this binary" % name)
+        elif not found:
+            problems.append("%s: no STDRET (should pop %d)" % (name, want))
+        elif found != {want}:
+            problems.append("%s: pops %s, should pop %d"
+                            % (name, sorted(found), want))
+    defined = {n for _, n in starts}
+    for name in sorted(HAND_WRITTEN - defined):
+        problems.append("%s: listed in HAND_WRITTEN but no body in %s"
+                        % (name, os.path.basename(shims_path)))
+    if problems:
+        print("[!] hand-written shims disagree with the derived counts:",
+              file=sys.stderr)
+        for p in problems:
+            print("      " + p, file=sys.stderr)
+        raise SystemExit(1)
+    print("  %d hand-written shims verified against derived counts" % len(starts))
+
+
 def main(argv):
     exe = argv[0] if argv else os.path.join(_here, 'analysis', 'nocturne.exe')
     out = argv[1] if len(argv) > 1 else os.path.join(
@@ -167,7 +160,7 @@ def main(argv):
 
     info = analyze_pe(exe)
     iat = build_iat_map(info)
-    rows, unresolved = resolve(iat)
+    rows, unresolved = ArgcResolver().resolve_iat(iat)
 
     if unresolved:
         print("[!] could not derive an argument count for %d import(s):"
@@ -180,9 +173,22 @@ def main(argv):
               "    32-bit SDK library.", file=sys.stderr)
         return 1
 
+    # A HAND_WRITTEN name that is not actually imported means a typo, and a typo
+    # here fails silently: the stub stays and looks just like the shim not being
+    # reached. Say so rather than emitting something quietly wrong.
+    imported = {real for _, _, _, real, _ in rows}
+    stray = sorted(HAND_WRITTEN - imported)
+    if stray:
+        print("[!] HAND_WRITTEN names not in this binary's import table: %s"
+              % ", ".join(stray), file=sys.stderr)
+        return 1
+
     emit(rows, out)
+    check_hand_written(rows, os.path.join(os.path.dirname(out), 'shims_impl.c'))
     by_dll = collections.Counter(d for _, d, _, _, _ in rows)
-    print("%d import bridges across %d DLLs -> %s" % (len(rows), len(by_dll), out))
+    print("%d import bridges across %d DLLs (%d hand-written, %d stubs) -> %s"
+          % (len(rows), len(by_dll), len(HAND_WRITTEN),
+             len(imported) - len(HAND_WRITTEN), out))
     for dll, n in sorted(by_dll.items()):
         print("  %-16s %d" % (dll, n))
     return 0

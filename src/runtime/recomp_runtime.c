@@ -22,6 +22,7 @@
 #include "recomp_types.h"
 #include "imports.h"
 #include "image_loader.h"
+#include "crash_report.h"
 
 /* ============================================================
  * Register file
@@ -60,7 +61,55 @@ uint32_t g_enter_idx = 0;
 #define STACK_SIZE           0x00400000u   /* 4 MB */
 #define ALLOC_GRANULARITY    0x00010000u   /* VirtualAlloc's base granularity */
 
+static uint32_t g_stack_base = 0;
 static uint32_t g_stack_top = 0;
+static uint32_t g_image_span = 0;
+
+/* Region bounds, so the shims can answer VirtualQuery without duplicating the
+ * layout constants. */
+uint32_t recomp_image_base(void) { return NOCTURNE_IMAGE_BASE; }
+uint32_t recomp_image_end(void)  { return NOCTURNE_IMAGE_BASE + g_image_span; }
+uint32_t recomp_stack_base(void) { return g_stack_base; }
+uint32_t recomp_stack_end(void)  { return g_stack_top; }
+
+int shims_init(uint32_t base);
+uint32_t shims_arena_base(void);
+uint32_t shims_arena_end(void);
+
+/* Declared in recomp_types.h, defined per project. Nothing extra to dump unless
+ * the build enabled the per-function entry tracer. */
+#ifdef RECOMP_TRACE
+void recomp_trace_enter(uint32_t va) {
+    g_enter_trace[g_enter_idx & (RECOMP_ENTER_SIZE - 1)] = va;
+    g_enter_idx++;
+}
+#endif
+
+void recomp_dump_trace(const char* why) {
+#ifdef RECOMP_TRACE
+    fprintf(stderr, "  last %d function entries (oldest first):\n", RECOMP_ENTER_SIZE);
+    for (int i = 0; i < RECOMP_ENTER_SIZE; i++) {
+        uint32_t idx = (g_enter_idx - RECOMP_ENTER_SIZE + i) & (RECOMP_ENTER_SIZE - 1);
+        if (g_enter_trace[idx])
+            fprintf(stderr, "    sub_%08X\n", g_enter_trace[idx]);
+    }
+#else
+    (void)why;
+#endif
+}
+
+/* Turn a simulated VA into a region name for the crash report. A bad pointer's
+ * region is usually the whole diagnosis: "read of 00000000" is a null deref,
+ * "read of 03200004 (heap arena)" is a use of freed or uninitialised memory. */
+static const char* describe_region(uint32_t va) {
+    if (va < 0x10000u)                          return "(null page)";
+    if (va >= NOCTURNE_IMAGE_BASE && va < NOCTURNE_IMAGE_BASE + g_image_span)
+                                                return "(image)";
+    if (va >= g_stack_base && va < g_stack_top) return "(stack)";
+    if (va >= shims_arena_base() && va < shims_arena_end())
+                                                return "(heap arena)";
+    return "(unmapped)";
+}
 
 /* Place the stack immediately above the mapped image.
  *
@@ -81,6 +130,7 @@ static int map_stack(uint32_t image_base, uint32_t span) {
         return 0;
     }
     memset(p, 0, STACK_SIZE);
+    g_stack_base = base;
     g_stack_top = base + STACK_SIZE;
     fprintf(stderr, "[runtime] stack 0x%08X-0x%08X\n", base, g_stack_top);
     return 1;
@@ -145,7 +195,15 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[runtime] mapped %s at 0x%08X, %.1f MB\n",
             image, NOCTURNE_IMAGE_BASE, span / 1048576.0);
 
+    g_image_span = span;
     if (!map_stack(NOCTURNE_IMAGE_BASE, span)) return 1;
+
+    /* The heap arena goes above the stack, so image / stack / heap are three
+     * disjoint regions climbing the low 32 bits in a fixed order. */
+    if (!shims_init(g_stack_top)) return 1;
+
+    recomp_set_region_describer(describe_region);
+    recomp_install_crash_handler();
 
     nocturne_install_iat();
     fprintf(stderr, "[runtime] %u lifted functions, %u import bridges\n",
