@@ -75,6 +75,7 @@ uint32_t recomp_stack_end(void)  { return g_stack_top; }
 int shims_init(uint32_t base);
 uint32_t shims_arena_base(void);
 uint32_t shims_arena_end(void);
+uint32_t shims_make_tib(uint32_t stack_base, uint32_t stack_top);
 
 /* Declared in recomp_types.h, defined per project. Nothing extra to dump unless
  * the build enabled the per-function entry tracer. */
@@ -201,6 +202,11 @@ int main(int argc, char** argv) {
     /* The heap arena goes above the stack, so image / stack / heap are three
      * disjoint regions climbing the low 32 bits in a fixed order. */
     if (!shims_init(g_stack_top)) return 1;
+
+    /* fs: is thread-relative; the lifter emits FS_BASE + offset for it, so the
+     * base has to point at a TIB before any lifted code touches fs:[0]. */
+    g_fs_base = shims_make_tib(g_stack_base, g_stack_top);
+    if (!g_fs_base) return 1;
 
     recomp_set_region_describer(describe_region);
     recomp_install_crash_handler();

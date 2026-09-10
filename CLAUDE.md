@@ -82,10 +82,23 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   imbalance during CRT startup leaks the dummy return address into an out-pointer
   argument at `sub_0056E9D0`. The callee null-checks, so 0 is inert. Finding the
   real argument-count mismatch is open work — then restore a poisoned value.
-- **Current blocker: no FS segment / TEB.** `sub_0056EED8` installs the CRT's SEH
-  frame via `fs:[0]`; `g_fs_base` is 0 so it reads the null page. Fix: allocate a
-  TEB-shaped block in the arena, point `g_fs_base` at it. We never dispatch SEH,
-  so the chain just needs to be writable memory.
+- **FS/TIB: DONE.** `shims_make_tib()` allocates a TIB in the arena, `g_fs_base`
+  points at it, `fs:[0]` seeded to 0xFFFFFFFF. Verified: `ebx=FFFFFFFF` at the
+  next fault is that sentinel read back. The lifter already emitted
+  `FS_BASE + off` for all 3 fs: sites, so no re-lift was needed.
+- **Current blocker: the CRT's `malloc(244)` returns NULL** inside
+  `sub_005635C0`, so the per-thread block at `0x02DE4E3C` (.bss, single writer
+  `0x00567227`) stays 0 and `sub_0056EED8` writes through it.
+  Our VirtualAlloc succeeds — the shim log shows 64 KB MEM_COMMIT satisfied at
+  0x03210000 — so the fault is in the CRT's own heap bookkeeping.
+  **Already tested and DISPROVEN (do not redo):** (1) GlobalMemoryStatus zeroed
+  struct — implemented properly, CRT never calls it here; (2) 64 KB allocation
+  granularity — fixed, no change; (3) `push es/fs/gs` miscounted as 2 bytes —
+  the lifter already emits PUSH32 correctly. Next: instrument sub_005635C0,
+  don't guess-and-rebuild.
+- CPU-cheap workflow: `cmake --build <dir> -- -j 2`. Only runtime files change,
+  so Ninja rebuilds 2 objects + links. Do NOT re-run run_lift.py unless the
+  lifter changed.
 - Debugging: `-DRECOMP_TRACE` gives the function-entry ring buffer; the crash
   handler prints `g_cur_func`, registers, ICALL history, and region names.
 

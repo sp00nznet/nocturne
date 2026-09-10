@@ -37,6 +37,8 @@ from stdcall_argc import ArgcResolver
 HAND_WRITTEN = {
     # Memory
     'VirtualAlloc', 'VirtualFree', 'VirtualQuery',
+    'GlobalMemoryStatus', 'GlobalAlloc', 'GlobalFree', 'GlobalLock',
+    'GlobalUnlock',
     # Process / thread identity
     'GetModuleHandleA', 'GetCurrentThreadId', 'GetCurrentProcessId',
     'GetCurrentThread', 'GetCurrentProcess', 'GetVersion', 'GetStdHandle',

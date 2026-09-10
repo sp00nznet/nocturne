@@ -36,6 +36,7 @@
 
 #define ARENA_SIZE   0x20000000u   /* 512 MB of reserved address space */
 #define PAGE_SZ      0x1000u
+#define ALLOC_GRAN   0x10000u      /* Win32 allocation granularity: 64 KB */
 
 static uint32_t g_arena_base = 0;
 static uint32_t g_arena_next = 0;
@@ -60,8 +61,53 @@ int shims_init(uint32_t base) {
     return 1;
 }
 
+/* Defined below, next to the rest of the arena. Declared here because the TIB is
+ * allocated out of it and an implicit declaration would assume int. */
+static uint32_t virt_alloc(uint32_t want_va, uint32_t size);
+
 uint32_t shims_arena_base(void) { return g_arena_base; }
 uint32_t shims_arena_end(void)  { return g_arena_end; }
+
+/* ============================================================
+ * The simulated TIB
+ *
+ * `fs:` is thread-relative on Win32, and the lifter knows it -- it emits
+ * FS_BASE + offset for every fs: access rather than treating the segment as
+ * flat. The runtime just has to point FS_BASE (g_fs_base) at a block shaped
+ * like a TIB. Leave it 0 and `fs:[0]` reads address 0, which is what the null
+ * dereference during CRT startup was.
+ *
+ * Only the first few fields matter here. fs:[0] is the head of the structured
+ * exception handler chain, which the Watcom CRT links a record into on the way
+ * up; 0xFFFFFFFF is the real end-of-chain sentinel. StackBase/StackLimit are
+ * read by stack-probing code.
+ *
+ * We never dispatch SEH -- exceptions go to the host's handler -- so the chain
+ * is only ever written and walked by the program itself. It needs to be
+ * writable memory that looks right, and nothing more.
+ * ============================================================ */
+
+#define TIB_EXCEPTION_LIST  0x00
+#define TIB_STACK_BASE      0x04   /* high address: the top of the stack */
+#define TIB_STACK_LIMIT     0x08   /* low address: the bottom */
+#define TIB_SELF            0x18   /* linear address of the TIB itself */
+#define TIB_THREAD_ID       0x24
+#define TIB_PEB             0x30
+#define TIB_SIZE            0x1000
+
+uint32_t shims_make_tib(uint32_t stack_base, uint32_t stack_top) {
+    uint32_t tib = virt_alloc(0, TIB_SIZE);
+    if (!tib) return 0;
+    memset((void*)ADDR(tib), 0, TIB_SIZE);
+    MEM32(tib + TIB_EXCEPTION_LIST) = 0xFFFFFFFFu;   /* end of chain */
+    MEM32(tib + TIB_STACK_BASE)     = stack_top;
+    MEM32(tib + TIB_STACK_LIMIT)    = stack_base;
+    MEM32(tib + TIB_SELF)           = tib;
+    MEM32(tib + TIB_THREAD_ID)      = 0x1000;        /* matches GetCurrentThreadId */
+    MEM32(tib + TIB_PEB)            = 0;             /* no PEB until something asks */
+    fprintf(stderr, "[shims] TIB 0x%08X\n", tib);
+    return tib;
+}
 
 static uint32_t arena_commit(uint32_t va, uint32_t size) {
     if (!VirtualAlloc((void*)(uintptr_t)va, size, MEM_COMMIT, PAGE_READWRITE))
@@ -84,11 +130,19 @@ static uint32_t virt_alloc(uint32_t want_va, uint32_t size) {
         return arena_commit(want_va & ~(PAGE_SZ - 1), size);
     }
 
-    if ((uint64_t)g_arena_next + size > g_arena_end) {
+    /* Win32 guarantees that VirtualAlloc with lpAddress = NULL returns memory
+     * aligned to the *allocation granularity* (64 KB), not merely to a page.
+     * That is not a detail: heap managers of this era routinely find a block's
+     * header by masking the low 16 bits off a pointer into it, so handing back
+     * a merely page-aligned block makes them compute a header address that is
+     * not one. Honour the guarantee. */
+    uint32_t base = (g_arena_next + ALLOC_GRAN - 1) & ~(ALLOC_GRAN - 1);
+    if ((uint64_t)base + size > g_arena_end) {
         fprintf(stderr, "[shims] heap arena exhausted (%u MB requested)\n",
                 size / 1048576u);
         return 0;
     }
+    g_arena_next = base;
     uint32_t va = g_arena_next;
     if (!arena_commit(va, size)) {
         fprintf(stderr, "[shims] commit 0x%08X (%u bytes) failed (%lu)\n",
@@ -104,10 +158,21 @@ static uint32_t virt_alloc(uint32_t want_va, uint32_t size) {
  * ============================================================ */
 
 void imp_VirtualAlloc(void) {
-    uint32_t addr = ARG(0), size = ARG(1);
-    /* ARG(2) flAllocationType, ARG(3) flProtect: the arena is RW and committed
-     * on demand, so RESERVE and COMMIT collapse to the same thing here. */
-    g_eax = virt_alloc(addr, size);
+    uint32_t addr = ARG(0), size = ARG(1), type = ARG(2);
+    /* ARG(3) flProtect: the arena is RW and committed on demand, so RESERVE and
+     * COMMIT collapse to the same thing here. */
+    uint32_t got = virt_alloc(addr, size);
+    /* The first handful of allocations are the CRT building its heap, and what
+     * it asks for -- and whether it got it -- is the first thing you want to
+     * know when the heap comes back empty. Capped so it stays quiet once the
+     * game is running and allocating in earnest. */
+    static int logged = 0;
+    if (logged < 16) {
+        fprintf(stderr, "[shims] VirtualAlloc(addr=%08X, size=%u, type=%08X) -> %08X\n",
+                addr, size, type, got);
+        logged++;
+    }
+    g_eax = got;
     STDRET(4);
 }
 
@@ -263,6 +328,65 @@ void imp_GetEnvironmentStrings(void) {
 /* The block is arena memory that is never reclaimed, so there is nothing to do
  * -- but the slot still has to be popped. */
 void imp_FreeEnvironmentStringsA(void) { RET(1); STDRET(1); }
+
+/* ============================================================
+ * Global heap and memory status
+ *
+ * The Watcom CRT will not hand out a single byte until it believes the machine
+ * has memory. GlobalMemoryStatus fills a caller-supplied struct, and a stub that
+ * returns 0 without touching it leaves a zeroed MEMORYSTATUS -- a machine with
+ * no physical memory and none available -- so the CRT's calloc fails every
+ * request, including the 244-byte per-thread block it needs before it can do
+ * anything else.
+ *
+ * Report a plausible 1999 machine. The shipping readme asks for 64 MB, 96 MB for
+ * hardware 3D; 256 MB is comfortably above that without being large enough to
+ * upset size arithmetic in code that never expected a big number.
+ * ============================================================ */
+
+#define MS_LENGTH          0
+#define MS_MEMORY_LOAD     4
+#define MS_TOTAL_PHYS      8
+#define MS_AVAIL_PHYS     12
+#define MS_TOTAL_PAGEFILE 16
+#define MS_AVAIL_PAGEFILE 20
+#define MS_TOTAL_VIRTUAL  24
+#define MS_AVAIL_VIRTUAL  28
+#define MS_SIZEOF         32
+
+#define PHYS_TOTAL   (256u * 1024u * 1024u)
+#define PHYS_AVAIL   (192u * 1024u * 1024u)
+
+void imp_GlobalMemoryStatus(void) {
+    uint32_t p = ARG(0);
+    if (p) {
+        MEM32(p + MS_LENGTH)          = MS_SIZEOF;
+        MEM32(p + MS_MEMORY_LOAD)     = 25;             /* percent in use */
+        MEM32(p + MS_TOTAL_PHYS)      = PHYS_TOTAL;
+        MEM32(p + MS_AVAIL_PHYS)      = PHYS_AVAIL;
+        MEM32(p + MS_TOTAL_PAGEFILE)  = PHYS_TOTAL;
+        MEM32(p + MS_AVAIL_PAGEFILE)  = PHYS_AVAIL;
+        /* Virtual: report what the arena can actually still hand out, so the
+         * engine's own sizing decisions match reality rather than a fiction. */
+        MEM32(p + MS_TOTAL_VIRTUAL)   = ARENA_SIZE;
+        MEM32(p + MS_AVAIL_VIRTUAL)   = g_arena_end - g_arena_next;
+    }
+    STDRET(1);
+}
+
+/* GlobalAlloc returns a handle. For GMEM_FIXED that handle *is* the pointer, and
+ * GlobalLock on it is the identity -- which is the shape everything here relies
+ * on, so movable blocks are simply never produced. */
+void imp_GlobalAlloc(void) {
+    /* ARG(0) uFlags: GMEM_ZEROINIT (0x40) is the only one that changes anything,
+     * and arena pages arrive zeroed either way. */
+    RET(virt_alloc(0, ARG(1)));
+    STDRET(2);
+}
+
+void imp_GlobalFree(void)   { RET(0); STDRET(1); }   /* NULL means success */
+void imp_GlobalLock(void)   { RET(ARG(0)); STDRET(1); }
+void imp_GlobalUnlock(void) { RET(0); STDRET(1); }
 
 /* ============================================================
  * Process / thread identity

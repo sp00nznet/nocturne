@@ -63,7 +63,7 @@ null-checks both out-pointers, a leaked 0 makes it skip the store rather than
 fault, and bring-up continues. The build sets it; it is a mitigation, not a fix,
 and the imbalance is the first thing to chase next.
 
-## Fault 2 — no FS segment, no TEB (open)
+## Fault 2 — no FS segment, no TEB (FIXED)
 
 Execution then reaches `sub_0056EED8`:
 
@@ -79,18 +79,75 @@ This is the CRT installing its structured exception handler by linking a record
 into the `fs:[0]` chain. The runtime has `g_fs_base = 0` and no TEB, so `fs:[0]`
 resolves to address 0 and reads the null page.
 
-The fix is small and well understood: allocate a TEB-shaped block in the arena
-and point `g_fs_base` at it. The SEH chain then becomes a linked list in
-simulated memory that nobody walks, since we do not dispatch SEH — the CRT is
-satisfied, and exceptions keep going to the host handler.
+The lifter already knew `fs:` was thread-relative — it emits `FS_BASE + offset`
+for every `fs:` access rather than treating the segment as flat, and there are
+only **three `fs:` sites in the whole binary**. The runtime simply never set the
+base. `shims_make_tib()` now allocates a TIB-shaped block in the arena and
+`g_fs_base` points at it, with `fs:[0]` seeded to `0xFFFFFFFF` (the real
+end-of-chain sentinel) and StackBase/StackLimit filled in.
 
-Related and worth resolving at the same time: the accessor behind
-`[0x5c1abc]` is reached at `0x005671E4`, which disassembles to a bare `ret` —
-the last byte of the function that starts at `0x005671DC` (`mov eax,[mem]; lea
-eax,[eax]; ret`). A call landing on a function's final `ret` returns without
-setting `eax`, which is why `eax` is 0 above. Whether the CRT genuinely
-initialises that pointer to a no-op stub, or the pointer is being read before it
-is written, is the open question.
+Confirmed working: the register dump at the next fault shows `ebx=FFFFFFFF`,
+which is that sentinel, read back through `fs:[0]`. No re-lift was needed.
+
+We never dispatch SEH — exceptions go to the host handler — so the chain only
+ever needs to be writable memory that looks right.
+
+## Fault 3 — the CRT's malloc returns NULL (open)
+
+Execution stops at the same instruction, but for a different reason now. The
+chain is fully traced:
+
+```
+00567227  mov [0x02DE4E3C], eax    ; store the per-thread CRT block
+0056720C  ...  call sub_0056E56C   ; which allocates it
+0056E57E    call sub_00565C50      ; calloc(1, [0x5C20CC] = 244)
+00565C5B      call sub_005635B0    ; -> malloc(244)
+005635C0        (270 bytes of heap bookkeeping)
+```
+
+`0x02DE4E3C` lives in `.bss`, so it starts as 0. Its single writer is
+`0x00567227`, and the trace confirms that instruction's function *did* run — so
+the store happened and stored zero. `malloc(244)` is failing, and every later
+`fs:[0]` user reads a null per-thread block.
+
+The allocation itself is not the problem: the shim log shows the CRT's one
+request succeeding.
+
+```
+[shims] VirtualAlloc(addr=00000000, size=65536, type=00001000) -> 03210000
+```
+
+64 KB, `MEM_COMMIT`, satisfied. So the failure is inside the CRT's own heap
+bookkeeping over that block.
+
+### Three hypotheses, tested and wrong
+
+Recording these so the next person does not spend the cycles again:
+
+1. **`GlobalMemoryStatus` reporting a machine with no memory.** A stub returning
+   0 leaves a zeroed `MEMORYSTATUS`, which would be a good reason for a heap to
+   refuse. Implemented it properly — no change, and the trace shows the CRT never
+   calls it on this path.
+2. **Allocation granularity.** `virt_alloc` returned page-aligned addresses,
+   but Win32 guarantees `VirtualAlloc(NULL, …)` is aligned to the 64 KB
+   allocation granularity, and heap managers of this era routinely find a block
+   header by masking the low 16 bits. Fixed — the address is now `0x03210000` —
+   no change.
+3. **Segment pushes miscounted.** `sub_005635C0`'s prologue does
+   `push es/fs/gs`, which are 4 bytes each in 32-bit mode, and its argument read
+   at `[esp+0x2c]` depends on that. If the lifter modelled them as 2 bytes the
+   size argument would be garbage. It does not: it emits
+   `PUSH32(esp, _seg_es)`. Correct already.
+
+Fixes 1 and 2 are right on their own terms and stay in. Neither was the blocker.
+
+### Next
+
+Stop guessing and instrument. `sub_005635C0` is 270 bytes of free-list walking;
+the useful next step is a runtime probe on its internals — or on the heap
+globals it reads — rather than another rebuild against a hypothesis. Worth
+checking early: whether the block returned by `VirtualAlloc` is ever recorded in
+the CRT's heap root at all, which is a single global to watch.
 
 ## Shims so far
 
@@ -124,7 +181,7 @@ register, crashing somewhere unrelated. Worth having the machine check.
 
 ## Next
 
-1. Give `fs:` a TEB. Unblocks SEH installation.
+1. Instrument `sub_005635C0` and find why `malloc(244)` returns NULL.
 2. Find the argument-count mismatch behind the marker leak, and put
    `RECOMP_RETADDR` back to a poisoned value.
 3. Keep walking: file I/O shims, then `WinMain`, then the POD mount that
