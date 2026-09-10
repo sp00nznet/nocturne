@@ -20,52 +20,42 @@ interface the engine already exposes.
 
 ## Status
 
-🟢 **Phase 4 complete — it builds, it links, and it runs its own startup code.**
-5,546 functions lifted with 0 errors, linked into a single native executable that
-maps Nocturne's real 42 MB image at `0x00400000` and executes lifted **Watcom CRT
-startup** out through the import bridges:
-
-```
-[runtime] mapped nocturne.exe at 0x00400000, 42.0 MB
-[runtime] stack 0x02E00000-0x03200000
-[runtime] 5546 lifted functions, 171 import bridges
-[import-stub] GetModuleHandleA
-[import-stub] VirtualQuery
-[import-stub] GetCurrentThreadId
-[import-stub] GetStdHandle
-[import-stub] CreateEventA
-[import-stub] VirtualAlloc
-```
-
-That is the whole chain working end to end: image mapped at its real VA → IAT
-installed → lifted `call dword ptr [slot]` → dispatch → shim → stdcall-correct
-return. It stops there because every shim is still a stub, so `VirtualAlloc`
-hands the CRT a null heap. 253 functions carry their **original C++ names** and
-522 their **original source files**; all 41 POD archives (**12,383 files**) read
-by `tools/pod.py`.
+🟢 **Phase 7 in progress — a real window, real files, and the engine runs as
+far as the renderer.** 6,027 functions lift with 0 errors into a single native
+executable that maps Nocturne's real 42 MB image at `0x00400000` and runs it:
+image mapped at its real VA → IAT installed → lifted `call dword ptr [slot]` →
+dispatch → shim → stdcall-correct return, 95 of the 171 imports with real bodies.
+253 functions carry their **original C++ names** and 522 their **original source
+files**; all 41 POD archives (**12,383 files**) read by `tools/pod.py`.
 
 | Phase | What | State |
 |------:|------|:-----:|
 | 0 | Reconnaissance — PE analysis, imports, compiler ID, engine seams | ✅ done |
 | 1 | Disassembly + symbol recovery — 5,494 funcs, 253 named, 522 file-attributed | ✅ done |
 | 2 | POD archive reader — both formats, 41 archives, 12,383 files | ✅ done |
-| 3 | Lift to C — 5,546 funcs, 885,918 lines, 0 errors, compiles clean | ✅ done |
+| 3 | Lift to C — 6,027 funcs, 903,247 lines, 0 errors, compiles clean | ✅ done |
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
-| 7 | Bring-up — CRT startup, `WinMain`, window creation, clean exit | 🟡 in progress |
+| 7 | Bring-up — CRT, `WinMain`, real window, real file I/O, engine init | 🟡 in progress |
 
-Bring-up now runs **all of Watcom CRT startup, then `WinMain`, a window class and
-a window** — 34,987 indirect calls and a clean exit:
+Bring-up now runs the Watcom CRT, `WinMain`, **a real Win32 window with the
+game's own window procedure driving it**, real file I/O, CPU detection, and the
+engine's own allocator — 124,827 indirect calls before it reaches the renderer:
 
 ```
-[import-stub] FindWindowA          <- single-instance check
-[import-stub] RegisterClassA       <- window class
-[import-stub] CreateWindowExA      <- window
-[runtime] entry returned; 34987 indirect calls
+[shims] RegisterClassA("Nocturne") wndproc=sub_00558D90 atom=49915
+[shims] CreateWindowExA("Nocturne", style=80000000) -> 00000000029D0970
+[import-stub] DirectSoundEnumerateA
+[shims] VirtualAlloc(size=1232896) -> 03450000     <- engine pools
+current lifted function: sub_00552E00              <- wincore\wddvmem.cpp
 ```
 
-It stops there only because every shim on that path still returns failure.
+The window is a genuine host window: `RegisterClassA` registers a host class
+whose procedure calls *back into lifted code* with the arguments pushed onto the
+simulated stack, and `PeekMessage`/`DispatchMessage` run the game's real message
+loop. It stops in `wddvmem.cpp` because DirectDraw is not implemented — that is
+Phase 6, so the stopping point is now the renderer rather than a shim.
 
 Getting there turned up a lifting bug worth knowing about: a body whose last
 instruction neither returns nor jumps *falls through* into the next function, and
@@ -80,12 +70,23 @@ three build-and-run cycles.
 "It runs" means the CRT's opening moves execute correctly. It is not the same as
 playable: every shim is a stub, nothing renders, no POD is mounted. See
 **[docs/PHASE3.md](docs/PHASE3.md)** and **[docs/PHASE4.md](docs/PHASE4.md)** —
-including the four bugs these phases found in the *shared* toolchain, all fixed
-upstream. Two are worth naming: `shl` computed its carry flag at a hardcoded
-32-bit width, so CF came out 0 for every narrow left shift in every project on
-the toolchain; and the PE loader tested `SizeOfRawData == 0` for "uninitialized
-section", which is true of MSVC's `.bss` by coincidence and false of Watcom's —
-on Nocturne it would have copied 42 MB out of a 1.9 MB buffer over the BSS.
+including the bugs these phases found in the *shared* toolchain, all fixed
+upstream. Four are worth naming:
+
+* `shl` computed its carry flag at a hardcoded 32-bit width, so CF came out 0
+  for every narrow left shift in every project on the toolchain.
+* The PE loader tested `SizeOfRawData == 0` for "uninitialized section", true of
+  MSVC's `.bss` by coincidence and false of Watcom's — on Nocturne it would have
+  copied 42 MB out of a 1.9 MB buffer, over the BSS.
+* `ebp` was lifted as a *per-function local*. That is indistinguishable from the
+  truth for a well-behaved function, and wrong the moment an optimising compiler
+  scatters one function's blocks across the image: every block addresses the same
+  frame through `ebp`, and a private copy starting at 0 turns `[ebp-0x20]` into a
+  read of `0xFFFFFFE0`.
+* `PUSHFD` rebuilt EFLAGS from the arithmetic-flag model and dropped bit 21.
+  Toggling that bit and reading it back is how a binary of this era asks whether
+  `CPUID` exists — so the answer was always "no", and Nocturne put up *"This CPU
+  does not have an MMX unit"* and quit.
 
 ## Why Nocturne is a better target than it looks
 

@@ -55,6 +55,27 @@ HAND_WRITTEN = {
     # Program identity / environment: what the CRT builds argv and environ from
     'GetCommandLineA', 'GetCommandLineW', 'GetModuleFileNameA',
     'GetModuleFileNameW', 'GetEnvironmentStrings', 'FreeEnvironmentStringsA',
+    # File I/O: forwarded to the host's own Win32, which is the same API
+    'CreateFileA', 'ReadFile', 'WriteFile', 'SetFilePointer', 'GetFileType',
+    'FlushFileBuffers', 'GetFileTime', 'SetFileTime',
+    'FindFirstFileA', 'FindNextFileA', 'FindClose',
+    'GetFileAttributesA', 'SetFileAttributesA', 'DeleteFileA', 'MoveFileA',
+    'CreateDirectoryA', 'GetCurrentDirectoryA', 'SetCurrentDirectoryA',
+    'GetFullPathNameA',
+    # Window, message pump and time: also forwarded to the host
+    'RegisterClassA', 'CreateWindowExA', 'DefWindowProcA',
+    'PeekMessageA', 'TranslateMessage', 'DispatchMessageA', 'PostQuitMessage',
+    'ShowWindow', 'UpdateWindow', 'BringWindowToTop', 'SetForegroundWindow',
+    'SetFocus', 'IsIconic', 'SetCursor', 'SetCursorPos', 'MoveWindow',
+    'GetClientRect', 'SetRectEmpty', 'InvalidateRect', 'FindWindowA',
+    'MessageBoxA', 'LoadIconA', 'LoadCursorA', 'GetStockObject',
+    'timeGetTime', 'timeBeginPeriod', 'timeEndPeriod', 'Sleep',
+    'QueryPerformanceCounter', 'QueryPerformanceFrequency', 'GetLocalTime',
+    # Devices with no implementation yet: they report absent, not success
+    'waveOutGetDevCapsA', 'waveOutOpen', 'joyGetDevCapsA', 'joyGetPos',
+    'mciSendStringA', 'DirectSoundCreate', 'DirectDrawCreate',
+    # Exit really exits
+    'ExitProcess',
 }
 
 

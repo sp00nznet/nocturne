@@ -73,9 +73,30 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
 - Generated files are gitignored: `src/recomp/gen/`, `src/runtime/imports_gen.c`.
 
 ## Bring-up State (Phase 7)
-- 32 of 171 imports have real bodies in `src/runtime/shims_impl.c`; the rest log
+- 95 of 171 imports have real bodies in `src/runtime/shims_impl.c`; the rest log
   once and return 0. Add a name to `HAND_WRITTEN` in gen_imports.py AND write the
   body — the generator fails if one exists without the other.
+- **A stub that returns 0 is not neutral.** MMSYSERR_NOERROR, DS_OK, DD_OK and
+  MMSYSERR_* are all zero, so a stub claims success and leaves the caller's out
+  struct uninitialised. waveOutGetDevCapsA doing that put garbage into a CRT
+  printf and faulted three frames away. Unimplemented devices report *absent*.
+- **File I/O and the window are forwarded to the host's own Win32** — the host
+  IS Windows. The only translation is the handle: a HANDLE is 64-bit here and a
+  32-bit slot over there, so open files/finds/windows/GDI objects live in tagged
+  tables (`H_FILE_TAG`/`H_FIND_TAG`/`H_OBJ_TAG`). Buffers need no translation;
+  simulated memory is host memory, so ReadFile writes straight into the image.
+- **The window procedure calls back INTO lifted code** (`call_lifted()`): push
+  args below the current ESP, push the dummy return address, run, restore ESP.
+  Restoring ESP rather than trusting the callee's epilogue means it works for a
+  stdcall or a cdecl body.
+- **A pointer lParam cannot survive the 32-bit round trip.** WM_NCCREATE carries
+  a host CREATESTRUCT*; the game gets a truncated half and hands it back to
+  DefWindowProcA, which dereferences it, returns FALSE, and aborts
+  CreateWindowEx. `g_cur_msg` remembers the real lParam for the message in
+  flight and gives it back. If the engine ever *reads* one, marshal that struct.
+- **ExitProcess must actually exit.** A stub that returns lets the game run past
+  its own decision to quit, and everything after is code the original would
+  never have executed.
 - **gen_imports.py verifies every hand-written shim's STDRET against the derived
   count on each run.** Never hand-tune a STDRET to "make it work".
 - **Build sets `RECOMP_RETADDR=0u`** as a MITIGATION, not a fix: a stack
@@ -123,6 +144,20 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
 5. `runtime/recomp32/crash_report.{c,h}` — the VEH crash reporter was trapped
    inside an XWA-specific `main.c`. Now standalone, reports `g_cur_func`, and
    takes a region-describer callback so bad pointers print their region.
+6. `recover.py` only treated `jmp`/`call` into another body as an alternate
+   entry. Watcom reaches a shared epilogue with `jcc` just as readily, and those
+   were left as `ITAIL: unresolved` — a tail call that silently does nothing.
+   It also never re-scanned a *recovered* body for alternate entries of its own,
+   so recovery is now a fixpoint. +236 functions on this binary (5,791 → 6,027).
+7. `lift32.FUNCTION_LOCALS` declared `ebp` as a per-function local. Correct for a
+   well-behaved function, wrong the moment the compiler scatters one function's
+   blocks across the image: they all address the same frame through ebp, and a
+   private copy starting at 0 makes `[ebp-0x20]` read `0xFFFFFFE0`. ebp is a
+   register; it lives in recomp_types.h with the rest of the file.
+8. `recomp_eflags()`'s FK_EFLAGS path masked EFLAGS down to the six arithmetic
+   bits, dropping AC (18) and ID (21). Toggling ID and reading it back is the
+   universal CPUID probe — so the answer was always "no CPUID", and Nocturne put
+   up "This CPU does not have an MMX unit" and quit.
 
 Also found: the sibling projects' hand-typed import ARGC table gives
 `waveOutOpen` 7 args; the SDK decoration says 6. Not fixed there — noted as the
@@ -135,8 +170,8 @@ reason this project derives the counts instead.
   and alternate-entry scan shared by all lift drivers. `--selftest`.
 - `pcrecomp/runtime/recomp32/crash_report.{c,h}` — crash diagnostics.
 
-## Current Numbers (Phase 3, 2026-09-09)
-- 5,494 functions (673 FLIRT library, 190 thunks, 39 no-return), 1.46 MB code
+## Current Numbers (Phase 7, 2026-09-10)
+- 6,027 lifted functions (5,494 from IDA + 533 recovered), 903,247 lines of C
 - 171 imports across 8 DLLs (KERNEL32 89, USER32 30, GDI32 14, ADVAPI32 5,
   DSOUND 2 by ordinal, DDRAW 1)
 - 99 original source files / 7 dirs; 88 classes; 266 `Class::method` names
@@ -157,7 +192,8 @@ All three are candidates to upstream into pcrecomp; `pod.py` supersedes
 ## Roadmap
 0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C ✅ ·
 4 shims + BSS ✅ · 5 build & link ✅ · 6 renderer (37-call `APIDLL*` → D3D11) ·
-7 bring-up (real shim bodies first — VirtualAlloc is the current blocker)
+7 bring-up (CRT, WinMain, real window + message loop, file I/O, engine init;
+    now blocked on the renderer — `wincore\wddvmem.cpp` wants DirectDraw)
 
 ## Git Workflow
 - `main` branch only unless told otherwise. Private repo.
