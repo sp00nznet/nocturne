@@ -1,0 +1,49 @@
+# --- Original game binary & assets: NEVER commit (copyright) ---
+*.exe
+*.EXE
+*.dll
+*.DLL
+*.iso
+*.ISO
+*.pod
+*.POD
+*.zip
+*.7z
+*.bin
+_iso/
+_game/
+_extracted/
+gamedata/
+
+# --- Derived analysis artifacts (regenerate from your own copy) ---
+analysis/*.json
+analysis/*.csv
+analysis/*.log
+analysis/*.txt
+analysis/*.i64
+analysis/*.idb
+
+# --- Generated lift output (large; regenerated from the binary) ---
+src/recomp/gen/
+
+# --- Build output ---
+build/
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- Editor / OS cruft ---
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
