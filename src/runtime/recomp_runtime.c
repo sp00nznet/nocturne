@@ -1,0 +1,169 @@
+/*
+ * Nocturne Recompilation - runtime core.
+ *
+ * Owns the simulated machine the lifted code runs inside: the register file, the
+ * memory image, the stack, and the three lookup paths RECOMP_ICALL/ITAIL use to
+ * turn a 32-bit VA back into a C function.
+ *
+ * Memory model: the original PE is mapped at its real image base (0x00400000) by
+ * the shared loader, so g_mem_base stays 0 and every MEM32(va) is a direct read
+ * of the program's own data. That requires the host executable to be linked at a
+ * high base so the target's range is free -- see CMakeLists.
+ *
+ * Nocturne's .bss is 42 MB. That is not an allocation to make at startup and
+ * hand out; it is part of the image, mapped and zeroed with everything else.
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "recomp_types.h"
+#include "imports.h"
+#include "image_loader.h"
+
+/* ============================================================
+ * Register file
+ * ============================================================ */
+
+uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+uint32_t g_ebx = 0, g_esi = 0, g_edi = 0, g_ebp = 0;
+uint16_t g_seg_cs = 0, g_seg_ds = 0, g_seg_es = 0;
+uint16_t g_seg_fs = 0, g_seg_gs = 0, g_seg_ss = 0;
+uint32_t g_fs_base = 0, g_gs_base = 0;
+
+double   g_st[8]   = {0};
+int      g_fp_top  = 0;
+uint16_t g_fpu_cw  = 0x037F;   /* x87 default: round-to-nearest, 64-bit mantissa */
+uint64_t g_mm[8]   = {0};      /* MMX file; Nocturne is an MMX build */
+
+ptrdiff_t g_mem_base = 0;      /* 1:1 mapping -- see the note above */
+
+uint32_t g_cur_func = 0;
+uint32_t g_icall_trace[ICALL_TRACE_SIZE] = {0};
+uint32_t g_icall_trace_idx = 0;
+uint32_t g_icall_count = 0;
+
+#ifdef RECOMP_TRACE
+uint32_t g_enter_trace[RECOMP_ENTER_SIZE] = {0};
+uint32_t g_enter_idx = 0;
+#endif
+
+/* ============================================================
+ * Memory layout
+ * ============================================================ */
+
+#define NOCTURNE_IMAGE_BASE  0x00400000u
+
+/* Watcom's CRT probes and the engine's deep call chains both want room. */
+#define STACK_SIZE           0x00400000u   /* 4 MB */
+#define ALLOC_GRANULARITY    0x00010000u   /* VirtualAlloc's base granularity */
+
+static uint32_t g_stack_top = 0;
+
+/* Place the stack immediately above the mapped image.
+ *
+ * Below it is not safe: Nocturne's image spans 42 MB from 0x00400000, so only
+ * ~4 MB of address space exists underneath and a 4 MB stack based at 0x00100000
+ * runs to 0x00500000 -- straight into the image. That collision is what
+ * ERROR_INVALID_ADDRESS was reporting. Deriving the base from the actual span
+ * means it cannot silently overlap whatever the next target's image looks like.
+ */
+static int map_stack(uint32_t image_base, uint32_t span) {
+    uint32_t base = (image_base + span + ALLOC_GRANULARITY - 1)
+                    & ~(ALLOC_GRANULARITY - 1);
+    void* p = VirtualAlloc((void*)(uintptr_t)base, STACK_SIZE,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) {
+        fprintf(stderr, "[runtime] stack VirtualAlloc @ 0x%08X (%u MB) failed (%lu)\n",
+                base, STACK_SIZE / 1048576u, GetLastError());
+        return 0;
+    }
+    memset(p, 0, STACK_SIZE);
+    g_stack_top = base + STACK_SIZE;
+    fprintf(stderr, "[runtime] stack 0x%08X-0x%08X\n", base, g_stack_top);
+    return 1;
+}
+
+/* ============================================================
+ * Dispatch
+ * ============================================================ */
+
+/* Binary search over the generated table, which run_lift.py emits sorted by VA. */
+recomp_func_t recomp_lookup(uint32_t va) {
+    uint32_t lo = 0, hi = recomp_dispatch_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint32_t k = recomp_dispatch_table[mid].address;
+        if (k == va) return recomp_dispatch_table[mid].func;
+        if (k < va) lo = mid + 1;
+        else hi = mid;
+    }
+    return NULL;
+}
+
+/* Hand-installed overrides, for bisecting a bad lift during bring-up: point one
+ * VA at a hand-written body without regenerating anything. Empty by design. */
+recomp_func_t recomp_lookup_manual(uint32_t va) {
+    (void)va;
+    return NULL;
+}
+
+/* Import bridges. The table is small (171) and generated in IAT order, which is
+ * not sorted, so this is a linear scan. It is called once per import call; if it
+ * ever shows up in a profile, sort the generated table and bisect it.
+ * ponytail: linear scan over 171 entries, sort + bisect if it ever matters. */
+recomp_func_t recomp_lookup_import(uint32_t va) {
+    for (uint32_t i = 0; i < nocturne_import_bridge_count; i++)
+        if (nocturne_import_bridges[i].address == va)
+            return nocturne_import_bridges[i].func;
+    return NULL;
+}
+
+void nocturne_install_iat(void) {
+    for (uint32_t i = 0; i < nocturne_iat_slot_count; i++) {
+        uint32_t slot = nocturne_iat_slots[i];
+        MEM32(slot) = slot;
+    }
+}
+
+/* ============================================================
+ * Entry
+ * ============================================================ */
+
+#define NOCTURNE_ENTRY  0x00567152u   /* PE entry point (Watcom CRT startup) */
+
+int main(int argc, char** argv) {
+    const char* image = (argc > 1) ? argv[1] : "nocturne.exe";
+
+    uint32_t span = recomp_load_image(image, NOCTURNE_IMAGE_BASE);
+    if (!span) {
+        fprintf(stderr, "[runtime] could not map %s\n", image);
+        return 1;
+    }
+    fprintf(stderr, "[runtime] mapped %s at 0x%08X, %.1f MB\n",
+            image, NOCTURNE_IMAGE_BASE, span / 1048576.0);
+
+    if (!map_stack(NOCTURNE_IMAGE_BASE, span)) return 1;
+
+    nocturne_install_iat();
+    fprintf(stderr, "[runtime] %u lifted functions, %u import bridges\n",
+            recomp_dispatch_count, nocturne_import_bridge_count);
+
+    g_esp = g_stack_top - 0x100;    /* leave a little headroom above the frame */
+    g_ebp = 0;
+
+    recomp_func_t entry = recomp_lookup(NOCTURNE_ENTRY);
+    if (!entry) {
+        fprintf(stderr, "[runtime] entry 0x%08X is not in the dispatch table\n",
+                NOCTURNE_ENTRY);
+        return 1;
+    }
+
+    PUSH32(g_esp, RECOMP_RETADDR);
+    entry();
+
+    fprintf(stderr, "[runtime] entry returned; %u indirect calls\n", g_icall_count);
+    return 0;
+}

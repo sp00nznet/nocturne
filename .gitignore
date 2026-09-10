@@ -47,3 +47,6 @@ __pycache__/
 *.user
 Thumbs.db
 .DS_Store
+
+# --- Generated import bridge layer (regenerate: py -3 gen_imports.py) ---
+src/runtime/imports_gen.c

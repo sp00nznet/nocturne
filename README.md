@@ -20,31 +20,50 @@ interface the engine already exposes.
 
 ## Status
 
-🟢 **Phase 3 complete — the whole binary is C, and the C compiles.** 5,542
-functions lifted with **0 lift errors**, 885,836 lines, and MSVC accepts all 14
-chunks with **0 errors and 0 warnings**. 253 functions carry their **original C++
-names** and 522 their **original source files**, straight out of the asserts
-Terminal Reality left in the retail build; all 41 POD archives (**12,383 files**)
-read by `tools/pod.py`.
+🟢 **Phase 4 complete — it builds, it links, and it runs its own startup code.**
+5,546 functions lifted with 0 errors, linked into a single native executable that
+maps Nocturne's real 42 MB image at `0x00400000` and executes lifted **Watcom CRT
+startup** out through the import bridges:
+
+```
+[runtime] mapped nocturne.exe at 0x00400000, 42.0 MB
+[runtime] stack 0x02E00000-0x03200000
+[runtime] 5546 lifted functions, 171 import bridges
+[import-stub] GetModuleHandleA
+[import-stub] VirtualQuery
+[import-stub] GetCurrentThreadId
+[import-stub] GetStdHandle
+[import-stub] CreateEventA
+[import-stub] VirtualAlloc
+```
+
+That is the whole chain working end to end: image mapped at its real VA → IAT
+installed → lifted `call dword ptr [slot]` → dispatch → shim → stdcall-correct
+return. It stops there because every shim is still a stub, so `VirtualAlloc`
+hands the CRT a null heap. 253 functions carry their **original C++ names** and
+522 their **original source files**; all 41 POD archives (**12,383 files**) read
+by `tools/pod.py`.
 
 | Phase | What | State |
 |------:|------|:-----:|
 | 0 | Reconnaissance — PE analysis, imports, compiler ID, engine seams | ✅ done |
 | 1 | Disassembly + symbol recovery — 5,494 funcs, 253 named, 522 file-attributed | ✅ done |
 | 2 | POD archive reader — both formats, 41 archives, 12,383 files | ✅ done |
-| 3 | Lift to C — 5,542 funcs, 885,836 lines, 0 errors, compiles clean | ✅ done |
-| 4 | Shim layer — 171 import bridges, Watcom CRT, 42 MB static BSS image | ⬜ |
-| 5 | Build & link — one native exe | ⬜ |
+| 3 | Lift to C — 5,546 funcs, 885,918 lines, 0 errors, compiles clean | ✅ done |
+| 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
+| 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
-| 7 | Bring-up — CRT → WinMain → window → POD mount → menu → in-game | ⬜ |
+| 7 | Bring-up — real shim bodies → WinMain → window → POD mount → menu | ⬜ next |
 
-"It compiles" means 5,542 function bodies are valid C with no unresolved
-identifiers against the runtime header. It is not the same as correct: nothing is
-linked yet, no import bridge exists, the 42 MB BSS has no home, and not one
-instruction has run. See **[docs/PHASE3.md](docs/PHASE3.md)** — including the
-three bugs this phase found in the *shared* toolchain, all fixed upstream, one of
-which had `shl` computing its carry flag at a hardcoded 32-bit width, so CF came
-out 0 for every narrow left shift in every project on the toolchain.
+"It runs" means the CRT's opening moves execute correctly. It is not the same as
+playable: every shim is a stub, nothing renders, no POD is mounted. See
+**[docs/PHASE3.md](docs/PHASE3.md)** and **[docs/PHASE4.md](docs/PHASE4.md)** —
+including the four bugs these phases found in the *shared* toolchain, all fixed
+upstream. Two are worth naming: `shl` computed its carry flag at a hardcoded
+32-bit width, so CF came out 0 for every narrow left shift in every project on
+the toolchain; and the PE loader tested `SizeOfRawData == 0` for "uninitialized
+section", which is true of MSVC's `.bss` by coincidence and false of Watcom's —
+on Nocturne it would have copied 42 MB out of a 1.9 MB buffer over the BSS.
 
 ## Why Nocturne is a better target than it looks
 
@@ -137,8 +156,12 @@ py -3.11 tools/pod.py list _game/Nocturne/music.pod
 # Lift the whole binary to C (needs analysis/ida_funcs.json from the step above)
 py -3.11 run_lift.py analysis/nocturne.exe src/recomp/gen
 
-# Check it still compiles (a CMake build replaces this in Phase 5)
-cl /nologo /c /W1 /I src\recomp\gen src\recomp\gen\*.c
+# Generate the 171 import bridges (arg counts derived from the SDK import libs)
+py -3.11 gen_imports.py
+
+# Build the native executable
+cmake -S . -B build -G Ninja && cmake --build build
+build/nocturne_recomp.exe analysis/nocturne.exe
 
 # Function catalog + bounds (pcrecomp)
 py -3.11 ../tools/tools/ida/ida_funcs.py analysis/nocturne.exe analysis/ida_funcs.json

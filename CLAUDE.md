@@ -58,6 +58,20 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`.
   Currently 0 errors, 0 warnings, 15 objects.
 
+## Runtime (Phase 4/5)
+- `src/runtime/recomp_runtime.c` — register file, dispatch lookups, IAT install,
+  entry. `src/runtime/imports.h` — ARG/RET/STDRET macros.
+- **The stack goes ABOVE the image**, at a base derived from the loaded span.
+  Below does not fit: only ~4 MB exists under 0x00400000 and a 4 MB stack at
+  0x00100000 runs into the image at 0x00400000 (ERROR_INVALID_ADDRESS).
+- `gen_imports.py` derives every stdcall arg count from the decoration `_Name@N`
+  in the Windows SDK's **32-bit** import libs. It REFUSES to emit an import it
+  cannot derive — never add a guessed count, a wrong STDRET desynchronises the
+  simulated stack silently. Ordinal imports resolve via the system DLL's exports.
+- Build is x64 host (the CMakeLists enforces it) so the target's VA range is free.
+  `cmake -S . -B build -G Ninja && cmake --build build`
+- Generated files are gitignored: `src/recomp/gen/`, `src/runtime/imports_gen.c`.
+
 ## Upstream Bugs Found And Fixed (pcrecomp)
 1. `lift32.FUNCTION_LOCALS` — the lifter/driver locals contract existed nowhere;
    each driver's hand-copied preamble went stale when `_flag_k` was added.
@@ -66,6 +80,15 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
 3. `op_bits()` — `shl` (and `shld`/`shrd`) hardcoded a 32-bit width for the carry
    flag and the shifted-in bits. CF was 0 for every narrow left shift, silently,
    in every project on the toolchain. Two sites in this binary.
+4. `image_loader.c` tested `SizeOfRawData == 0` for "uninitialized section". That
+   is only true of MSVC's `.bss` by coincidence; Watcom puts the MEMORY size
+   there and leaves `PointerToRawData` 0, so the loader would have copied 42 MB
+   from file offset 0 out of a 1.9 MB buffer, over the BSS. Now tests
+   `PointerToRawData == 0` and clamps the copy to the file and the mapped span.
+
+Also found: the sibling projects' hand-typed import ARGC table gives
+`waveOutOpen` 7 args; the SDK decoration says 6. Not fixed there — noted as the
+reason this project derives the counts instead.
 
 ## Current Numbers (Phase 3, 2026-09-09)
 - 5,494 functions (673 FLIRT library, 190 thunks, 39 no-return), 1.46 MB code
@@ -88,8 +111,8 @@ All three are candidates to upstream into pcrecomp; `pod.py` supersedes
 
 ## Roadmap
 0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C ✅ ·
-4 shims + BSS · 5 build & link · 6 renderer (37-call `APIDLL*` → D3D11) ·
-7 bring-up
+4 shims + BSS ✅ · 5 build & link ✅ · 6 renderer (37-call `APIDLL*` → D3D11) ·
+7 bring-up (real shim bodies first — VirtualAlloc is the current blocker)
 
 ## Git Workflow
 - `main` branch only unless told otherwise. Private repo.

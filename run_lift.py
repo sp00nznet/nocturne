@@ -48,9 +48,11 @@ COND_JUMPS = {'je','jne','jz','jnz','ja','jae','jb','jbe','jg','jge','jl','jle',
 # (malloc/free/calloc/realloc), the FDIV test, and the __CI* math intrinsics.
 HOST_SHIM = set()
 
-# FORCE_RECOVER: entries that overlap an existing body but are reached as their own
-# dispatchable tail-call target. EMPTY until bring-up produces an unresolved ITAIL
-# that turns out to land inside a known function.
+# FORCE_RECOVER: extra entries that overlap an existing body and must be lifted
+# anyway. The common case -- a direct `call` to a mid-body address, i.e. an
+# alternate entry point IDA merged away -- is now detected automatically in
+# _recover_missing_funcs, so this stays EMPTY. Add a VA here only for one the
+# scan cannot see, e.g. a target reached solely through a computed jump.
 FORCE_RECOVER = set()
 FPU_CMP = {'EQ':'==','NE':'!=','B':'<','BE':'<=','A':'>','AE':'>=',
            'L':'<','LE':'<=','G':'>','GE':'>='}
@@ -189,13 +191,25 @@ def _recover_missing_funcs(code_data, cs, ce, ida_fns):
     # sub_406FDA, which IDA missed and which have no direct call). The recursive
     # decode in Pass 2 validates each seed, so a stray data immediate that happens
     # to look like a code address just decodes to dead (never-called) code.
+    #
+    # Pass 1b, in the same sweep: a direct `call` to an address that IS covered by
+    # a known body but is not that body's entry is an *alternate entry point* --
+    # IDA merged what were several small routines into one function. The CPU will
+    # execute from there, so it needs its own lifted body; without one the lifter
+    # emits RECOMP_CALL(sub_<addr>) for a function nobody defines and the build
+    # dies at link time with an unresolved external. Only `call` counts: a `jmp`
+    # into a covered range is ordinary intra-function control flow.
     seeds = set()
+    alt_entries = set()
     for ea, end in fns:
         for ins in md.disasm(slice_at(ea, end-ea), ea):
             if ins.mnemonic in ('jmp','call'):
                 t = imm_of(ins)
-                if t is not None and cs <= t < ce and t not in entries and not covered(t):
-                    seeds.add(t)
+                if t is not None and cs <= t < ce and t not in entries:
+                    if not covered(t):
+                        seeds.add(t)
+                    elif ins.mnemonic == 'call':
+                        alt_entries.add(t)
             for op in (ins.operands or []):
                 if op.type == X86_OP_IMM:
                     t = op.imm & 0xFFFFFFFF
@@ -204,7 +218,8 @@ def _recover_missing_funcs(code_data, cs, ce, ida_fns):
 
     # Pass 2: recursively recover each seed (+ targets it reaches) to a fixpoint.
     recovered = {}
-    forced = {s for s in FORCE_RECOVER if cs <= s < ce and s not in entries}
+    forced = {s for s in (set(FORCE_RECOVER) | alt_entries)
+              if cs <= s < ce and s not in entries}
     work = list(seeds) + list(forced)
     while work:
         s = work.pop()
