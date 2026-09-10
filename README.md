@@ -20,22 +20,31 @@ interface the engine already exposes.
 
 ## Status
 
-🟢 **Phase 2 complete — the binary is partially self-naming and its data is
-readable from outside the engine.** 5,494 functions catalogued, 253 recovered
-with their **original C++ names** and 522 attributed to their **original source
-files** straight out of the asserts Terminal Reality left in the retail build;
-all 41 POD archives (**12,383 files**) now read by `tools/pod.py`.
+🟢 **Phase 3 complete — the whole binary is C, and the C compiles.** 5,542
+functions lifted with **0 lift errors**, 885,836 lines, and MSVC accepts all 14
+chunks with **0 errors and 0 warnings**. 253 functions carry their **original C++
+names** and 522 their **original source files**, straight out of the asserts
+Terminal Reality left in the retail build; all 41 POD archives (**12,383 files**)
+read by `tools/pod.py`.
 
 | Phase | What | State |
 |------:|------|:-----:|
 | 0 | Reconnaissance — PE analysis, imports, compiler ID, engine seams | ✅ done |
 | 1 | Disassembly + symbol recovery — 5,494 funcs, 253 named, 522 file-attributed | ✅ done |
 | 2 | POD archive reader — both formats, 41 archives, 12,383 files | ✅ done |
-| 3 | Lift to C — `lift32` over the IDA bounds, chunked output + dispatch table | ⬜ next |
+| 3 | Lift to C — 5,542 funcs, 885,836 lines, 0 errors, compiles clean | ✅ done |
 | 4 | Shim layer — 171 import bridges, Watcom CRT, 42 MB static BSS image | ⬜ |
 | 5 | Build & link — one native exe | ⬜ |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
 | 7 | Bring-up — CRT → WinMain → window → POD mount → menu → in-game | ⬜ |
+
+"It compiles" means 5,542 function bodies are valid C with no unresolved
+identifiers against the runtime header. It is not the same as correct: nothing is
+linked yet, no import bridge exists, the 42 MB BSS has no home, and not one
+instruction has run. See **[docs/PHASE3.md](docs/PHASE3.md)** — including the
+three bugs this phase found in the *shared* toolchain, all fixed upstream, one of
+which had `shl` computing its carry flag at a hardcoded 32-bit width, so CF came
+out 0 for every narrow left shift in every project on the toolchain.
 
 ## Why Nocturne is a better target than it looks
 
@@ -124,6 +133,12 @@ py -3.11 tools/ida_name_from_asserts.py analysis/nocturne.exe analysis/named.jso
 # Read the game's POD archives (both formats, stdlib only)
 py -3.11 tools/pod.py --selftest
 py -3.11 tools/pod.py list _game/Nocturne/music.pod
+
+# Lift the whole binary to C (needs analysis/ida_funcs.json from the step above)
+py -3.11 run_lift.py analysis/nocturne.exe src/recomp/gen
+
+# Check it still compiles (a CMake build replaces this in Phase 5)
+cl /nologo /c /W1 /I src\recomp\gen src\recomp\gen\*.c
 
 # Function catalog + bounds (pcrecomp)
 py -3.11 ../tools/tools/ida/ida_funcs.py analysis/nocturne.exe analysis/ida_funcs.json

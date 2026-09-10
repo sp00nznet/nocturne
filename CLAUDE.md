@@ -44,7 +44,30 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   `.MSN`↔`mission.cpp`, `.SET`↔`set.cpp`). Use it to pick which lifted functions
   to read when a format needs decoding.
 
-## Current Numbers (Phase 2, 2026-09-09)
+## Lift Pipeline (Phase 3)
+- `run_lift.py` is the Fury³/Hellbender driver retargeted. It selects the code
+  section by the `is_code` characteristic (NOT the name — Watcom calls it `AUTO`)
+  and slices with `Section.effective_size`.
+- **It copies `recomp_types.h` from the pcrecomp checkout on every run.** Do not
+  hand-copy that header into the project; the lifter and the header are two halves
+  of one contract and a stale copy is how the `_mm` bug hid.
+- Per-function scratch comes from `lift32.FUNCTION_LOCALS` — do not re-inline a
+  hand-written preamble list, that is what went stale before.
+- Build check (until Phase 5 brings CMake):
+  `cl /nologo /c /W1 /I src\recomp\gen src\recomp\gen\*.c` via
+  `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`.
+  Currently 0 errors, 0 warnings, 15 objects.
+
+## Upstream Bugs Found And Fixed (pcrecomp)
+1. `lift32.FUNCTION_LOCALS` — the lifter/driver locals contract existed nowhere;
+   each driver's hand-copied preamble went stale when `_flag_k` was added.
+2. `#define _mm g_mm` in `recomp_types.h` — the MMX alias was never added, so
+   every MMX body failed to compile against a global that was already declared.
+3. `op_bits()` — `shl` (and `shld`/`shrd`) hardcoded a 32-bit width for the carry
+   flag and the shifted-in bits. CF was 0 for every narrow left shift, silently,
+   in every project on the toolchain. Two sites in this binary.
+
+## Current Numbers (Phase 3, 2026-09-09)
 - 5,494 functions (673 FLIRT library, 190 thunks, 39 no-return), 1.46 MB code
 - 171 imports across 8 DLLs (KERNEL32 89, USER32 30, GDI32 14, ADVAPI32 5,
   DSOUND 2 by ordinal, DDRAW 1)
@@ -64,8 +87,9 @@ All three are candidates to upstream into pcrecomp; `pod.py` supersedes
 `fury3/tools/extract_pod.py` (which is POD1-only).
 
 ## Roadmap
-0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C · 4 shims + BSS ·
-5 build & link · 6 renderer (37-call `APIDLL*` → D3D11) · 7 bring-up
+0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C ✅ ·
+4 shims + BSS · 5 build & link · 6 renderer (37-call `APIDLL*` → D3D11) ·
+7 bring-up
 
 ## Git Workflow
 - `main` branch only unless told otherwise. Private repo.
