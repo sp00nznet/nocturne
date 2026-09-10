@@ -4,19 +4,12 @@ Where execution actually gets to, what stopped it, and what it took to find out.
 
 ## Where it gets to
 
-The Watcom CRT now runs a long way. It takes a heap, discovers its stack bounds,
-builds `argv` and `environ`, and reaches the point of installing its structured
-exception handler — hundreds of lifted functions deep, through 32 real shims.
+All of Watcom CRT startup, then `WinMain`, a window class and a window —
+**34,987 indirect calls and a clean exit**. The full log is at the bottom of this
+document; the short version is that startup is no longer the problem.
 
-```
-[runtime] mapped nocturne.exe at 0x00400000, 42.0 MB
-[runtime] stack 0x02E00000-0x03200000
-[shims] heap arena 0x03200000-0x23200000
-[runtime] 5546 lifted functions, 171 import bridges
-```
-
-No `[import-stub]` lines at all now: everything the CRT asks for on this path has
-a real body.
+Three faults got it there. The third turned out to be the cause of the first, and
+it was a lifting bug rather than anything to do with Nocturne.
 
 ## The crash reporter earned its keep immediately
 
@@ -35,7 +28,7 @@ inside a 900,000-line generated file. True, and useless. `recomp_install_crash_h
 
 Two faults, each diagnosed from one run.
 
-## Fault 1 — the marker leak (mitigated)
+## Fault 1 — the marker leak (FIXED, same cause as fault 3)
 
 The first fault was a write to `0xDEAD0000`, with `esi` holding the same value.
 That is `RECOMP_RETADDR`, the dummy return address `RECOMP_CALL` pushes — so a
@@ -54,14 +47,13 @@ stack imbalance had leaked it into a value. Building with the entry tracer
 ```
 
 This is Watcom's stack-limit routine, and `arg1` read back as the marker: the
-read ran past the arguments the caller actually pushed. The caller/callee
-argument-count mismatch behind that is **still open**.
+read ran past the arguments the caller actually pushed.
 
-`recomp_types.h` documents the mitigation for exactly this case — set
-`RECOMP_RETADDR` to 0 so a leaked marker is inert. Because the routine
-null-checks both out-pointers, a leaked 0 makes it skip the store rather than
-fault, and bring-up continues. The build sets it; it is a mitigation, not a fix,
-and the imbalance is the first thing to chase next.
+At the time this looked like a caller/callee argument-count mismatch. It was not
+— it is fault 3, four bytes of drift from an earlier call, and both are fixed by
+the same change. Setting `RECOMP_RETADDR` to 0 made it inert enough to keep
+moving (the routine null-checks its out-pointers), which was the right call to
+keep bring-up going but bought a wrong diagnosis with it.
 
 ## Fault 2 — no FS segment, no TEB (FIXED)
 
@@ -92,62 +84,125 @@ which is that sentinel, read back through `fs:[0]`. No re-lift was needed.
 We never dispatch SEH — exceptions go to the host handler — so the chain only
 ever needs to be writable memory that looks right.
 
-## Fault 3 — the CRT's malloc returns NULL (open)
+## Fault 3 — falling off the end of a function is not returning (FIXED)
 
-Execution stops at the same instruction, but for a different reason now. The
-chain is fully traced:
+This one was the root cause of fault 1 as well, and it took three wrong guesses
+to get to. Recording the wrong turns, because the wrong turns are the lesson.
 
-```
-00567227  mov [0x02DE4E3C], eax    ; store the per-thread CRT block
-0056720C  ...  call sub_0056E56C   ; which allocates it
-0056E57E    call sub_00565C50      ; calloc(1, [0x5C20CC] = 244)
-00565C5B      call sub_005635B0    ; -> malloc(244)
-005635C0        (270 bytes of heap bookkeeping)
-```
+### What it looked like
 
-`0x02DE4E3C` lives in `.bss`, so it starts as 0. Its single writer is
-`0x00567227`, and the trace confirms that instruction's function *did* run — so
-the store happened and stored zero. `malloc(244)` is failing, and every later
-`fs:[0]` user reads a null per-thread block.
-
-The allocation itself is not the problem: the shim log shows the CRT's one
-request succeeding.
+`sub_0056EED8` faulted writing through an argument that arrived as 0. Working
+backwards: the argument came from `[esp+8]` in `sub_00567458`, which came from
+`lea eax,[ebp-8]` in `sub_0056DF10` — a perfectly valid stack address. Every
+static check passed. The heap, which three hypotheses had blamed, turned out to
+be *fine*: adding a crash-time dump of the CRT's heap globals showed the block
+allocated and linked and the per-thread pointer set.
 
 ```
-[shims] VirtualAlloc(addr=00000000, size=65536, type=00001000) -> 03210000
+[005C1680] heap free-list    = 03210000
+[02DE4E3C] per-thread block  = 031FFDF8
 ```
 
-64 KB, `MEM_COMMIT`, satisfied. So the failure is inside the CRT's own heap
-bookkeeping over that block.
+### What it was
+
+The per-thread-block accessor lifted to this:
+
+```c
+eax = MEM32(0x2DE4E3C);   /* mov eax, [0x2de4e3c] */
+eax = eax;                /* lea eax, [eax]       */
+return; /* end of function */
+```
+
+No `ret`. IDA catalogues `sub_005671DC` as `[0x005671DC, 0x005671E4)` — the
+`ret` at `0x005671E4` is its own function, because it doubles as the no-op
+single-threaded heap lock (`[0x5C1AD8]` and `[0x5C1AE0]` both point at it). So
+the accessor *falls through* into it.
+
+The lift driver ended any body that did not end in `ret` with a bare `return;`.
+That silently drops the `ret`, so the dummy return address `RECOMP_CALL` pushed
+is never popped: **four bytes of simulated stack leaked per call.** The accessor
+is called constantly, and in `sub_00567458` the drift lands exactly here:
+
+```
+0x567477  call [0x5c1abc]   ; esp drifts -4, never restored
+0x567483  add esp, 8
+0x567486  mov ebx, [esp+8]  ; reads 4 bytes off -> the dummy return address
+0x56748B  call 0x56eed8     ; passes it as an out-pointer
+```
+
+With `RECOMP_RETADDR` at its default that argument was `0xDEAD0000` — fault 1.
+With the mitigation setting it to 0 it became a null write — fault 3. One bug.
+
+### The fix
+
+A body whose last instruction is neither `ret` nor an unconditional `jmp` now
+tail-calls its fall-through address instead of returning, so the next function's
+`ret` does the pop. **272 sites in this binary.**
+
+The companion gap surfaced immediately as `ITAIL: unresolved VA`: those
+fall-through targets have to be dispatchable, and a backward `jmp` into a
+*different* function's body is an alternate entry too — the recovery scan had
+been treating every jump into a covered range as ordinary control flow, which is
+only true within the same function. Both are fixed upstream in
+[pcrecomp](https://github.com/sp00nznet/pcrecomp) `e0f2d84`, with self-test
+coverage including the negative case.
+
+Recovered entries went 52 → **297**; total lifted functions 5,546 → **5,791**.
 
 ### Three hypotheses, tested and wrong
 
-Recording these so the next person does not spend the cycles again:
+Recording these so the next person does not spend the cycles again. All three
+were about the heap, and the heap was never the problem:
 
 1. **`GlobalMemoryStatus` reporting a machine with no memory.** A stub returning
-   0 leaves a zeroed `MEMORYSTATUS`, which would be a good reason for a heap to
-   refuse. Implemented it properly — no change, and the trace shows the CRT never
-   calls it on this path.
-2. **Allocation granularity.** `virt_alloc` returned page-aligned addresses,
-   but Win32 guarantees `VirtualAlloc(NULL, …)` is aligned to the 64 KB
-   allocation granularity, and heap managers of this era routinely find a block
-   header by masking the low 16 bits. Fixed — the address is now `0x03210000` —
-   no change.
-3. **Segment pushes miscounted.** `sub_005635C0`'s prologue does
-   `push es/fs/gs`, which are 4 bytes each in 32-bit mode, and its argument read
-   at `[esp+0x2c]` depends on that. If the lifter modelled them as 2 bytes the
-   size argument would be garbage. It does not: it emits
-   `PUSH32(esp, _seg_es)`. Correct already.
+   0 leaves a zeroed `MEMORYSTATUS`. Implemented it properly — no change, and
+   the trace shows the CRT never calls it on this path.
+2. **Allocation granularity.** `VirtualAlloc(NULL, …)` is documented to return
+   64 KB-aligned memory and heap managers of this era mask the low 16 bits to
+   find a block header. Fixed — no change.
+3. **Segment pushes miscounted.** `push es/fs/gs` are 4 bytes each in 32-bit
+   mode and an argument read depended on it. The lifter already emitted
+   `PUSH32` correctly.
 
-Fixes 1 and 2 are right on their own terms and stay in. Neither was the blocker.
+Fixes 1 and 2 are right on their own terms and stay in. The lesson: three
+build-and-run cycles against guesses produced nothing, and one crash-time dump
+of the actual state produced the answer. That is what
+`recomp_set_extra_reporter()` upstream is now for.
 
-### Next
+## It runs
 
-Stop guessing and instrument. `sub_005635C0` is 270 bytes of free-list walking;
-the useful next step is a runtime probe on its internals — or on the heap
-globals it reads — rather than another rebuild against a hypothesis. Worth
-checking early: whether the block returned by `VirtualAlloc` is ever recorded in
-the CRT's heap root at all, which is a single global to watch.
+```
+[runtime] mapped nocturne.exe at 0x00400000, 42.0 MB
+[shims] heap arena 0x03200000-0x23200000
+[shims] TIB 0x03200000
+[runtime] 5791 lifted functions, 171 import bridges
+[shims] VirtualAlloc(addr=00000000, size=65536, type=00001000) -> 03210000
+[import-stub] SetUnhandledExceptionFilter
+[import-stub] GetCPInfo
+[import-stub] CharUpperBuffA
+[import-stub] FindWindowA          <- single-instance check
+[import-stub] timeGetTime
+[import-stub] GetCurrentDirectoryA
+[import-stub] SetCurrentDirectoryA
+[import-stub] LoadIconA
+[import-stub] LoadCursorA
+[import-stub] GetStockObject
+[import-stub] RegisterClassA       <- window class
+[import-stub] CreateWindowExA      <- window
+[import-stub] SetFilePointer
+[import-stub] GetFileType
+[import-stub] ExitProcess
+[runtime] entry returned; 34987 indirect calls
+```
+
+**Exit code 0.** The whole Watcom CRT startup, locale initialisation, the
+single-instance check, working-directory setup, `WinMain`, window class
+registration and window creation — 34,987 indirect calls, no crash.
+
+It gets no further only because every shim on that path returns failure. Two
+indirect calls remain unresolved (`0x005671C6`, `0x004CEC00`), both to addresses
+IDA never catalogued as code at all, reached through function-pointer tables.
+Neither is fatal.
 
 ## Shims so far
 
@@ -181,8 +236,15 @@ register, crashing somewhere unrelated. Worth having the machine check.
 
 ## Next
 
-1. Instrument `sub_005635C0` and find why `malloc(244)` returns NULL.
-2. Find the argument-count mismatch behind the marker leak, and put
-   `RECOMP_RETADDR` back to a poisoned value.
-3. Keep walking: file I/O shims, then `WinMain`, then the POD mount that
-   `tools/pod.py` can already check the engine's answers against.
+1. **File I/O shims.** `CreateFileA` / `ReadFile` / `SetFilePointer` /
+   `GetFileType` backed by the real game directory. That is what stands between
+   here and mounting a POD — and `tools/pod.py` can already say exactly what the
+   engine should find inside one, which makes the first mount self-checking.
+2. **The window.** `RegisterClassA` / `CreateWindowExA` currently return 0. A
+   real window plus a message pump gets the engine into its main loop.
+3. **The second marker leak.** Building with `-DRECOMP_RETADDR=0xDEAD0000u`
+   still faults in `sub_0056DD80`, past window creation, with several registers
+   holding the marker. The default is back to 0 so bring-up can continue; turn
+   the poison on to hunt it.
+4. Then the renderer: 37 `APIDLL*` calls, testable against real textures well
+   before the engine can ask for them.

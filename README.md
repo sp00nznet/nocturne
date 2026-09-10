@@ -53,12 +53,29 @@ by `tools/pod.py`.
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
-| 7 | Bring-up — 32 real shims, CRT runs to SEH install | 🟡 in progress |
+| 7 | Bring-up — CRT startup, `WinMain`, window creation, clean exit | 🟡 in progress |
 
-Bring-up now gets the Watcom CRT through its heap, its stack-limit discovery,
-and `argv`/`environ`, stopping where it installs a structured exception handler
-through `fs:[0]` — the runtime has no TEB yet. 32 of 171 imports have real
-bodies. See **[docs/PHASE7.md](docs/PHASE7.md)**.
+Bring-up now runs **all of Watcom CRT startup, then `WinMain`, a window class and
+a window** — 34,987 indirect calls and a clean exit:
+
+```
+[import-stub] FindWindowA          <- single-instance check
+[import-stub] RegisterClassA       <- window class
+[import-stub] CreateWindowExA      <- window
+[runtime] entry returned; 34987 indirect calls
+```
+
+It stops there only because every shim on that path still returns failure.
+
+Getting there turned up a lifting bug worth knowing about: a body whose last
+instruction neither returns nor jumps *falls through* into the next function, and
+the driver was ending those with a bare `return`. That drops the `ret`, so the
+dummy return address is never popped and **four bytes of simulated stack leak per
+call** — 272 sites in this binary. The worst was a two-instruction accessor whose
+`ret` had been catalogued as a separate function because it doubles as the no-op
+heap lock. Fixed upstream. See **[docs/PHASE7.md](docs/PHASE7.md)**, which also
+records three hypotheses that were wrong, and why one crash-time state dump beat
+three build-and-run cycles.
 
 "It runs" means the CRT's opening moves execute correctly. It is not the same as
 playable: every shim is a stub, nothing renders, no POD is mounted. See

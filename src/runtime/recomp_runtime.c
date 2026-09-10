@@ -99,6 +99,43 @@ void recomp_dump_trace(const char* why) {
 #endif
 }
 
+static const char* describe_region(uint32_t va);   /* defined below */
+
+/* The Watcom CRT's heap state, printed with every crash report.
+ *
+ * Bring-up is currently stuck on malloc(244) returning NULL, and these are the
+ * globals that decide whether it can: two gates the grow path checks before it
+ * will even call VirtualAlloc, the free-list head the grown block gets linked
+ * into, and the per-thread block whose null value is what actually faults.
+ * Having them in the report turns one build-and-run per hypothesis into one run.
+ */
+static void report_crt_heap(void) {
+    static const struct { uint32_t va; const char* name; } watch[] = {
+        { 0x005C1FE8u, "grow gate A      " },
+        { 0x005C1CC8u, "grow gate B      " },
+        { 0x005C1680u, "heap free-list   " },
+        { 0x005C1684u, "heap cached block" },
+        { 0x005C1688u, "largest-free hint" },
+        { 0x02DE4E3Cu, "per-thread block " },
+    };
+    fprintf(stderr, "  CRT heap globals:\n");
+    for (unsigned i = 0; i < sizeof(watch) / sizeof(watch[0]); i++)
+        fprintf(stderr, "    [%08X] %s = %08X\n",
+                watch[i].va, watch[i].name, MEM32(watch[i].va));
+
+    /* The per-thread block is a 244-byte buffer in the CRT main wrapper's stack
+     * frame, and +0x54 is the slot the SEH installer writes its argument to and
+     * then dereferences. Show it, plus where the stack pointer is now: if the
+     * block sits below the live stack pointer, the slot is being overwritten
+     * rather than mis-stored, and those are different bugs. */
+    uint32_t blk = MEM32(0x02DE4E3Cu);
+    fprintf(stderr, "    per-thread block %08X %s, +0x54 = %08X\n",
+            blk, describe_region(blk), blk ? MEM32(blk + 0x54) : 0);
+    fprintf(stderr, "    esp now %08X, stack %08X-%08X (block is %s live esp)\n",
+            g_esp, g_stack_base, g_stack_top,
+            (blk && blk < g_esp) ? "BELOW" : "above");
+}
+
 /* Turn a simulated VA into a region name for the crash report. A bad pointer's
  * region is usually the whole diagnosis: "read of 00000000" is a null deref,
  * "read of 03200004 (heap arena)" is a use of freed or uninitialised memory. */
@@ -209,6 +246,7 @@ int main(int argc, char** argv) {
     if (!g_fs_base) return 1;
 
     recomp_set_region_describer(describe_region);
+    recomp_set_extra_reporter(report_crt_heap);
     recomp_install_crash_handler();
 
     nocturne_install_iat();

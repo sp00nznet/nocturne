@@ -42,18 +42,22 @@ target_include_directories(nocturne_recomp PRIVATE
   "${PCRECOMP}/runtime/recomp32"       # image_loader.h
 )
 
-# The dummy return address RECOMP_CALL pushes. It defaults to 0xDEAD0000, which
-# is easy to spot in a register dump -- and destructive the moment a stack
-# imbalance leaks it into a value, because code then writes through it.
+# The dummy return address RECOMP_CALL pushes. 0xDEAD0000 is the default: easy
+# to spot in a register dump, and deliberately destructive if a stack imbalance
+# ever leaks it into a value, so the leak announces itself instead of quietly
+# becoming a zero that some null check swallows.
 #
-# Nocturne has such a leak during Watcom CRT startup: a routine that takes two
-# optional out-pointers reads its second argument off the stack and gets the
-# marker, then stores through it. The routine null-checks both pointers, so with
-# the marker set to 0 the leak is inert and bring-up continues past it.
+# The big startup leak is fixed at its root -- lifted bodies that fell through
+# the end of a function never popped it (docs/PHASE7.md) -- and with it gone the
+# CRT reaches CreateWindowExA and exits cleanly.
 #
-# This is a mitigation, not a fix -- recomp_types.h documents it for exactly this
-# situation. The imbalance itself is still open; see docs/PHASE7.md.
-set(RECOMP_RETADDR "0u" CACHE STRING "Dummy return address pushed by RECOMP_CALL")
+# Building with the poisoned default still catches a *second*, later leak in
+# sub_0056DD80, past window creation, where several registers come back holding
+# the marker. That one is open. Default to 0 so bring-up can continue past it,
+# and configure with -DRECOMP_RETADDR=0xDEAD0000u to hunt it: the poison is the
+# canary, and it is worth turning back on whenever a value looks impossible.
+set(RECOMP_RETADDR "0u" CACHE STRING
+    "Dummy return address pushed by RECOMP_CALL; set 0xDEAD0000u to hunt leaks")
 target_compile_definitions(nocturne_recomp PRIVATE RECOMP_RETADDR=${RECOMP_RETADDR})
 
 if(MSVC)

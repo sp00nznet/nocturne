@@ -113,8 +113,29 @@ def lift_function_linear(lifter, name, instructions, leaders):
         if has_indirect or insn.address in leaders:
             lines.append(f'L_{insn.address:08X}:')
         for line in lifter.lift_instruction(insn): lines.append(f'    {line}')
+    # Falling off the end is NOT the same as returning. If the last instruction
+    # is neither a `ret` nor an unconditional `jmp`, control flows into whatever
+    # follows -- IDA routinely splits one routine in two, leaving the first half
+    # ending mid-flow and the `ret` owned by the next "function".
+    #
+    # Emitting a bare `return;` there silently drops that `ret`, so the dummy
+    # return address RECOMP_CALL pushed is never popped and the simulated stack
+    # leaks 4 bytes per call. Nocturne's per-thread-block accessor at 0x005671DC
+    # is exactly this: two instructions, with its `ret` at 0x005671E4 catalogued
+    # as a separate function (it doubles as the no-op single-threaded heap lock).
+    # It is called constantly, and the drift eventually shifts an argument read
+    # onto the dummy return address -- which then gets stored and dereferenced.
+    #
+    # Tail-call into the fall-through address instead: the dispatch resolves it
+    # to the next function, whose `ret` does the pop.
     if instructions and not instructions[-1].is_ret:
-        lines.append('    return; /* end of function */')
+        last = instructions[-1]
+        if last.is_uncond_jump:
+            lines.append('    return; /* tail call already transferred */')
+        else:
+            nxt = last.end_address
+            lines.append(f'    RECOMP_ITAIL(0x{nxt:08X}u); /* falls through */')
+            lines.append('    return;')
 
     # Intra-function indirect jumps (jump tables / switch statements) lift to
     # RECOMP_ITAIL(<runtime expr>), but the dispatch table only knows function

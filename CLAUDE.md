@@ -86,16 +86,20 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   points at it, `fs:[0]` seeded to 0xFFFFFFFF. Verified: `ebx=FFFFFFFF` at the
   next fault is that sentinel read back. The lifter already emitted
   `FS_BASE + off` for all 3 fs: sites, so no re-lift was needed.
-- **Current blocker: the CRT's `malloc(244)` returns NULL** inside
-  `sub_005635C0`, so the per-thread block at `0x02DE4E3C` (.bss, single writer
-  `0x00567227`) stays 0 and `sub_0056EED8` writes through it.
-  Our VirtualAlloc succeeds — the shim log shows 64 KB MEM_COMMIT satisfied at
-  0x03210000 — so the fault is in the CRT's own heap bookkeeping.
-  **Already tested and DISPROVEN (do not redo):** (1) GlobalMemoryStatus zeroed
-  struct — implemented properly, CRT never calls it here; (2) 64 KB allocation
-  granularity — fixed, no change; (3) `push es/fs/gs` miscounted as 2 bytes —
-  the lifter already emits PUSH32 correctly. Next: instrument sub_005635C0,
-  don't guess-and-rebuild.
+- **STARTUP WORKS.** CRT → WinMain → RegisterClassA → CreateWindowExA → clean
+  exit, 34,987 indirect calls. Root cause of the long stall was a LIFTING bug:
+  a body whose last instruction is neither `ret` nor `jmp` falls through to the
+  next function, and run_lift.py ended those with a bare `return;` — dropping the
+  `ret`, so the dummy return address was never popped. 4 bytes leaked per call,
+  272 sites. Fixed in run_lift.py + pcrecomp recover.py (e0f2d84).
+- The heap was NEVER broken. **Disproven hypotheses — do not redo:**
+  (1) GlobalMemoryStatus zeroed struct; (2) 64 KB allocation granularity;
+  (3) `push es/fs/gs` miscounted. (1) and (2) were fixed anyway, correctly.
+- **Lesson: three build-and-run cycles against guesses found nothing; one
+  crash-time dump of real state found it.** Use `recomp_set_extra_reporter()`.
+- **Second marker leak still open** in `sub_0056DD80`, past window creation.
+  Build with `-DRECOMP_RETADDR=0xDEAD0000u` to hunt it; default is 0u so
+  bring-up continues.
 - CPU-cheap workflow: `cmake --build <dir> -- -j 2`. Only runtime files change,
   so Ninja rebuilds 2 objects + links. Do NOT re-run run_lift.py unless the
   lifter changed.
