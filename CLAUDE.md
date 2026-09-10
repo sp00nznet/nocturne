@@ -31,10 +31,20 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   `CClass::method - ...`, so the binary carries a partial symbol table.
 - **42 MB static BSS.** Engine pools are static; the lifted image needs a real
   reserved region.
-- **Assets are POD archives** (Terminal Reality format; same family as Fury³ /
-  Hellbender). `engine\pod.cpp` is the reader, class `CPodFile`, with CRC audit.
+- **Assets are POD archives** — 41 of them, 12,383 files. Format is **fully
+  decoded** in `tools/pod.py`: 40 are POD2 (magic `POD2`, name table, per-file
+  checksums, 312-byte audit records at the very end after the file data), and
+  `tground.pod` alone is POD1 (no magic, 32-byte fixed names, 40-byte entries —
+  identical to Fury³/Hellbender). The assert `Invalid pod version!` is the tell.
+- **`.ACT` files are always exactly 768 bytes** (256×RGB palette); `.THM` always
+  3,072,000. `.RAW`+`.ACT`+`.FOG` triples are the texture pipeline, which is what
+  the renderer interface consumes.
+- **Asset extensions cross-check the assert module map** one-to-one
+  (`.KFM`↔`keyframe.cpp`, `.SKL`↔`skeleton.cpp`, `.CTH`↔`cloth.cpp`,
+  `.MSN`↔`mission.cpp`, `.SET`↔`set.cpp`). Use it to pick which lifted functions
+  to read when a format needs decoding.
 
-## Current Numbers (Phase 1, 2026-09-09)
+## Current Numbers (Phase 2, 2026-09-09)
 - 5,494 functions (673 FLIRT library, 190 thunks, 39 no-return), 1.46 MB code
 - 171 imports across 8 DLLs (KERNEL32 89, USER32 30, GDI32 14, ADVAPI32 5,
   DSOUND 2 by ordinal, DDRAW 1)
@@ -47,12 +57,14 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
 - `tools/ida_name_from_asserts.py` — walks IDA string xrefs to rename functions
   and attribute them to source files. Only renames on an unambiguous single
   candidate.
+- `tools/pod.py` — POD1/POD2 reader: `list`, `audit`, `extract`, `--selftest`.
+  Stdlib only, no IDA. Extraction refuses `..` traversal paths.
 
-Both are candidates to upstream into pcrecomp once a second Watcom target proves
-them.
+All three are candidates to upstream into pcrecomp; `pod.py` supersedes
+`fury3/tools/extract_pod.py` (which is POD1-only).
 
 ## Roadmap
-0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader · 3 lift to C · 4 shims + BSS ·
+0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C · 4 shims + BSS ·
 5 build & link · 6 renderer (37-call `APIDLL*` → D3D11) · 7 bring-up
 
 ## Git Workflow

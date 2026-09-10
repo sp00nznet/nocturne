@@ -20,17 +20,18 @@ interface the engine already exposes.
 
 ## Status
 
-🟢 **Phase 1 complete — the binary is disassembled and partially self-naming.**
-5,494 functions catalogued, 253 of them recovered with their **original C++
-names** and 522 attributed to their **original source files**, straight out of
-the asserts Terminal Reality left in the retail build.
+🟢 **Phase 2 complete — the binary is partially self-naming and its data is
+readable from outside the engine.** 5,494 functions catalogued, 253 recovered
+with their **original C++ names** and 522 attributed to their **original source
+files** straight out of the asserts Terminal Reality left in the retail build;
+all 41 POD archives (**12,383 files**) now read by `tools/pod.py`.
 
 | Phase | What | State |
 |------:|------|:-----:|
 | 0 | Reconnaissance — PE analysis, imports, compiler ID, engine seams | ✅ done |
 | 1 | Disassembly + symbol recovery — 5,494 funcs, 253 named, 522 file-attributed | ✅ done |
-| 2 | POD archive reader — mount the game's data outside the engine | ⬜ next |
-| 3 | Lift to C — `lift32` over the IDA bounds, chunked output + dispatch table | ⬜ |
+| 2 | POD archive reader — both formats, 41 archives, 12,383 files | ✅ done |
+| 3 | Lift to C — `lift32` over the IDA bounds, chunked output + dispatch table | ⬜ next |
 | 4 | Shim layer — 171 import bridges, Watcom CRT, 42 MB static BSS image | ⬜ |
 | 5 | Build & link — one native exe | ⬜ |
 | 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
@@ -74,6 +75,25 @@ classes** and **266 method names** — and walking the string xrefs attaches 253
 them to actual code. We start Phase 3 with a real symbol table and a module map
 for a binary that has neither.
 
+## The data is already open
+
+All 41 POD archives read, 12,383 files. Two formats: 40 are POD2 (name table,
+per-file checksums, and a trailing build-audit block), and `tground.pod` alone is
+the older POD1 — the *same layout Fury³ and Hellbender use*, a survivor from the
+studio's previous engine that nobody ever re-packed. The assert string
+`Invalid pod version!` is what told us to look for a second format.
+
+The extension census cross-checks the module map recovered in Phase 1 almost
+one-to-one — `.KFM`↔`keyframe.cpp`, `.SKL`↔`skeleton.cpp`, `.CTH`↔`cloth.cpp`,
+`.MSN`↔`mission.cpp`, `.SET`↔`set.cpp` — which is strong mutual confirmation that
+both are real. Full census and the audit-block format: **[docs/ASSETS.md](docs/ASSETS.md)**.
+
+```bash
+py -3.11 tools/pod.py --selftest                       # round-trips both formats
+py -3.11 tools/pod.py list    _game/Nocturne/music.pod
+py -3.11 tools/pod.py extract _game/Nocturne/STARTUP.POD _extracted/startup
+```
+
 ## Recon numbers
 
 | | Nocturne | Hellbender (for comparison) |
@@ -100,6 +120,10 @@ py -3.11 tools/mine_symbols.py analysis/nocturne.exe analysis/symbols.json
 
 # Attach those names back to code via IDA string xrefs (needs IDA + idalib)
 py -3.11 tools/ida_name_from_asserts.py analysis/nocturne.exe analysis/named.json
+
+# Read the game's POD archives (both formats, stdlib only)
+py -3.11 tools/pod.py --selftest
+py -3.11 tools/pod.py list _game/Nocturne/music.pod
 
 # Function catalog + bounds (pcrecomp)
 py -3.11 ../tools/tools/ida/ida_funcs.py analysis/nocturne.exe analysis/ida_funcs.json
