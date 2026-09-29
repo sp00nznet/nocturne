@@ -17,6 +17,7 @@ Two things differ from the MSVC targets, both because Nocturne is a Watcom build
 
 Usage: py -3 run_lift.py [analysis/nocturne.exe] [src/recomp/gen]
 """
+import glob
 import sys, os, json, time, re, shutil
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +95,10 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
     return instructions, leaders
 
 
+_MD = Cs(CS_ARCH_X86, CS_MODE_32)
+_MD.detail = True
+
+
 def lift_function_linear(lifter, name, instructions, leaders):
     va = name[4:] if name.startswith('sub_') else '0'
     # Per-function scratch comes from lift32.FUNCTION_LOCALS -- the lifter is the
@@ -109,9 +114,40 @@ def lift_function_linear(lifter, name, instructions, leaders):
     # the local dispatch below can reach it. Otherwise just label block leaders.
     has_indirect = any(i.is_uncond_jump and i.get_branch_target() is None
                        for i in instructions)
+    # A branch target is a join point: the lifter's static flag state describes
+    # the textually preceding instruction, not the flags the jump arrives with.
+    # Carried across the label, `cmp ebx,0x102; jae L` reached L's `jbe` as the
+    # TEST_Z of an unrelated `and` above it -- the window procedure's WM_CHAR
+    # branch was never taken, so no key ever reached the engine. Forget the
+    # static state there and let the jcc read the runtime _flag_k instead.
+    targets = {t for i in instructions if i.is_jump
+               for t in [i.get_branch_target()] if t is not None}
+    # A branch INTO an instruction. Watcom's CRT hides `mov edi, ecx` (89 CF)
+    # in the immediate of `test ax, 0xCF89` and has strchr's not-found path
+    # jump to it; a linear lift has no label there. Decode from the target until
+    # it rejoins the main stream, lift that as its own block, and jump back.
+    starts = {i.address for i in instructions}
+    lo = instructions[0].address if instructions else 0
+    raw = b''.join(i.bytes for i in instructions)
+    hidden = []
+    for t in sorted(t for t in targets if t not in starts and lo < t < lo + len(raw)):
+        seq, rejoin = [], None
+        for ins in _MD.disasm(raw[t - lo:], t):
+            if ins.address != t and ins.address in starts:
+                rejoin = ins.address
+                break
+            seq.append(LinearInstruction(ins))
+            if ins.mnemonic in ('ret', 'jmp'):
+                break
+        if rejoin is not None:
+            leaders = set(leaders) | {rejoin}
+            targets.add(rejoin)
+        hidden.append((t, seq, rejoin))
     for insn in instructions:
         if has_indirect or insn.address in leaders:
             lines.append(f'L_{insn.address:08X}:')
+            if has_indirect or insn.address in targets:
+                lifter._flag_state = None
         for line in lifter.lift_instruction(insn): lines.append(f'    {line}')
     # Falling off the end is NOT the same as returning. If the last instruction
     # is neither a `ret` nor an unconditional `jmp`, control flows into whatever
@@ -160,6 +196,16 @@ def lift_function_linear(lifter, name, instructions, leaders):
         lines.append('      default: RECOMP_ITAIL(_itail_tgt); return;')
         lines.append('    }')
 
+    for t, seq, rejoin in hidden:
+        lines.append(f'L_{t:08X}: /* inside the instruction stream */')
+        lifter._flag_state = None
+        for ins in seq:
+            for line in lifter.lift_instruction(ins): lines.append(f'    {line}')
+        if rejoin is not None:
+            lines.append(f'    goto L_{rejoin:08X};')
+    if hidden:
+        defined = sorted(set(re.findall(r'(?m)^\s*(L_[0-9A-Fa-f]{8})\s*:', '\n'.join(lines))))
+
     refed = set(re.findall(r'goto\s+(L_[0-9A-Fa-f]{8})', '\n'.join(lines)))
     for lbl in sorted(refed - set(defined)):
         lines.append(f'    {lbl}: RECOMP_ITAIL(0x{int(lbl[2:],16):08X}u); return;')
@@ -181,11 +227,94 @@ def write_chunk(out, idx, funcs):
 
 
 
+XI_START = 0x005C2302   # __InitRtns walks these records up to 0x005C26CE (0x56EF60)
+
+
+def watcom_init_targets(pe_data, info, cs, ce):
+    """Targets of the init/fini records from XI_START, read while they still
+    look like records (type 0..2, target in the code section)."""
+    import struct
+    sec = next(s for s in info.sections
+               if s.virtual_address <= XI_START - info.image_base < s.virtual_address + s.raw_size)
+    off = sec.raw_offset + (XI_START - info.image_base - sec.virtual_address)
+    out = set()
+    while off + 6 <= len(pe_data):
+        kind, _pri, fn = struct.unpack_from('<BBI', pe_data, off)
+        if kind > 2 or not (cs <= fn < ce):
+            break
+        out.add(fn)
+        off += 6
+    return out
+
+
+def data_code_pointers(pe_data, info, cs, ce, fns):
+    """Code addresses stored as data -- vtable and callback-table entries, and
+    `push offset fn` immediates handing a callback to a registration call --
+    that IDA never made a function. They are reached only through a pointer
+    (0x4C4180, a key predicate a registration table hands out, was the first).
+
+    Watcom also puts jump tables in the code section, and a data dword can
+    point anywhere, so a candidate must (a) follow a ret, a jmp or Watcom's
+    alignment padding, and (b) decode as ordinary code for a few instructions.
+    ponytail: heuristic; a false positive only costs an unused lifted body."""
+    import bisect, struct
+    starts = [a for a, _ in fns]
+    def covered(t):
+        i = bisect.bisect_right(starts, t) - 1
+        return i >= 0 and fns[i][0] <= t < fns[i][1]
+    code = next(s for s in info.sections if s.is_code)
+    def cbyte(va, n):
+        o = code.raw_offset + (va - info.image_base - code.virtual_address)
+        return pe_data[o:o + n]
+    pad = (b'\x8d\x80\x00\x00\x00\x00', b'\x8d\x92\x00\x00\x00\x00', b'\x8d\x40\x00',
+           b'\x8d\x52\x00', b'\x8b\xc0', b'\x89\xc9', b'\x8b\xdb', b'\x8b\xc9',
+           b'\x8b\xd2', b'\x90', b'\xc3')
+    first_ok = {'push', 'mov', 'sub', 'xor', 'cmp', 'test', 'fld', 'fldz', 'fild',
+                'call', 'jmp', 'lea', 'nop', 'and', 'or', 'ret', 'movzx', 'inc', 'dec'}
+    bad = {'in', 'out', 'insb', 'insd', 'outsb', 'outsd', 'lcall', 'ljmp', 'retf',
+           'int', 'int3', 'into', 'hlt', 'bound', 'arpl', 'aam', 'aad', 'aaa', 'aas',
+           'daa', 'das', 'salc', 'lahf', 'sahf', 'sti', 'cli', 'popal', 'pushal',
+           'lodsb', 'lodsd', 'scasb', 'scasd', 'movsb', 'movsd', 'cmpsb', 'cmpsd',
+           'stosb', 'stosd', 'loop', 'loope', 'loopne', 'jecxz', 'fisttp', 'rcl', 'rcr'}
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    out = set()
+    start_set = set(starts)
+    for s in info.sections:
+        if not s.raw_offset:
+            continue
+        d = pe_data[s.raw_offset:s.raw_offset + s.raw_size]
+        for o in range(len(d) - 3):
+            t = struct.unpack_from('<I', d, o)[0]
+            if not (cs + 8 <= t < ce) or t in out or t in start_set:
+                continue
+            # Inside the code section, a dword pointing into a body is usually a
+            # jump-table entry (Watcom keeps those in code). It counts only as
+            # the operand of `push imm32` / `mov reg, imm32` -- how a factory is
+            # handed to a class registration (CWerewolf's, at 0x555A60) -- or
+            # when it lands in a gap between bodies.
+            if s.is_code and covered(t) and not (d[o - 1] == 0x68 or 0xB8 <= d[o - 1] <= 0xBF):
+                continue
+            before = cbyte(t - 8, 8)
+            if not (any(before.endswith(p) for p in pad) or before[-5] == 0xE9
+                    or before[-2] == 0xEB):
+                continue
+            ins = list(md.disasm(cbyte(t, 48), t))[:4]
+            if (len(ins) == 4 and ins[0].mnemonic in first_ok
+                    and not any(i.mnemonic in bad or 'add byte ptr [' in
+                                f'{i.mnemonic} {i.op_str}' for i in ins)):
+                out.add(t)
+    return out
+
+
 def main():
     exe = sys.argv[1] if len(sys.argv)>1 else os.path.join(_here,'analysis','nocturne.exe')
     out = sys.argv[2] if len(sys.argv)>2 else os.path.join(_here,'src','recomp','gen')
     split = int(sys.argv[3]) if len(sys.argv)>3 else 400
     os.makedirs(out, exist_ok=True)
+    # A lift that produces fewer chunks than the last one would otherwise leave
+    # the old tail behind, and the build's glob links both copies.
+    for stale in glob.glob(os.path.join(out, 'recomp_[0-9][0-9][0-9][0-9].c')):
+        os.remove(stale)
 
     # The lifted code and recomp_types.h are two halves of one contract -- the
     # lifter emits _mm[n]/_flag_k and the header has to declare them. Copying the
@@ -217,7 +346,15 @@ def main():
     # `ITAIL: unresolved VA ...`; the second break the *build*, since the lifter
     # emits a call to a function nobody defines. pcrecomp's recover module finds
     # both -- see tools/lift/recover.py.
-    missing = recover_functions(code_data, cs, ce, fns, forced=FORCE_RECOVER)
+    # Watcom's static-initializer tables are a third kind: 6-byte records
+    # {type, priority, fn} the CRT calls through a pointer, so no scan of the
+    # code ever sees a reference to them. Two C++ class registrations lived
+    # only there and were never lifted. Seed every record's target.
+    forced = set(FORCE_RECOVER) | watcom_init_targets(pe_data, info, cs, ce)
+    ptrs = data_code_pointers(pe_data, info, cs, ce, fns)
+    print(f'[*] {len(ptrs)} uncatalogued code pointers found in data')
+    forced |= ptrs
+    missing = recover_functions(code_data, cs, ce, fns, forced=forced)
     if missing:
         fns.extend(missing); fns.sort()
         print(f'[*] recovered {len(missing)} functions IDA missed (thunks, tail calls, alt entries): '

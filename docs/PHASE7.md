@@ -248,3 +248,71 @@ register, crashing somewhere unrelated. Worth having the machine check.
    the poison on to hunt it.
 4. Then the renderer: 37 `APIDLL*` calls, testable against real textures well
    before the engine can ask for them.
+
+---
+
+## From the renderer to the Volume 1 intro (2026-09-29)
+
+Boot → menu → New Game → Volume 1 → the intro cinematic. What stood in the way,
+in the order it was found:
+
+### DirectDraw and the renderer DLL
+
+`wincore\wddvmem.cpp` uses IDirectDraw v1, a primary with a back buffer,
+Lock/Unlock/Flip and an 8-bit palette — and draws the pixels itself, so DirectDraw
+is only a presentation surface (`src/runtime/video.c`). COM objects live in
+simulated memory as `{vtbl, index}`; every vtable slot is a **host thunk**, a VA at
+`0xFFF00000+` that `recomp_lookup_manual` maps to a host function, and one
+dispatcher serves every method by thunk index, popping the argument count
+`ddraw.h` declares. Frames go to the window through GDI `StretchDIBits`.
+
+The renderer DLL's 37 exports were reverse-engineered into
+[RENDERER_API.md](RENDERER_API.md) and reimplemented on D3D9 fixed function
+(`src/runtime/renderer.c`); `LoadLibraryA("tridx7.dll")` returns a token and
+`GetProcAddress` returns host thunks. **It has not run on hardware yet**: the
+bring-up sessions have no display adapter (`GetAdapterCount() == 0`), so device
+creation fails and the engine falls back to its own software renderer — which is
+what reaches the intro.
+
+### Toolchain bugs (fixed upstream in pcrecomp)
+
+1. **`push es` is four bytes.** The narrow push/pop work made segment-register
+   pushes two bytes; in 32-bit code they move esp by 4 unless 66h-prefixed.
+   Watcom's init-table runner brackets every call with one.
+2. **Static flag state crossed jump targets.** At a label reached only by a
+   jump, the lifter still paired the `jbe` with the textually preceding `and`,
+   not the `cmp` the jump came from. The window procedure's WM_CHAR branch was
+   never taken: no key ever reached the engine. Fixed in both `run_lift.py` and
+   `generate.py`: forget the static state at every branch target.
+3. **An unresolved indirect call popped four bytes it never pushed.** Every miss
+   shifted the caller's stack by a slot. The first one was inside Watcom's
+   `__InitRtns`, which then lost its saved registers and skipped the ~90 C++
+   static constructors after it — the filter objects kept 0×0 sizes and
+   `CDemonFilter::allocMemory` reported "Out of memory".
+4. **`add` never published its carry.** `add eax,eax / adc edx,edx` (a 64-bit
+   shift) took the carry an earlier `imul` left behind.
+5. **`fild qword / fistp qword` went through a 53-bit double.** It is how this
+   era copies 8 bytes; the clipper moves a vertex's packed x,y that way, and a
+   large high dword rounded x to −20/65536 — a 65535-pixel span. The x87 stack
+   now shadows the exact int64 per slot.
+
+### Functions IDA never saw
+
+`run_lift.py` now also seeds: every target of Watcom's static-initializer table;
+code pointers stored as data, or as `push imm32`/`mov reg, imm32` operands (class
+factories handed to registration calls — `CWerewolf`'s was one); and code
+reached by jumping *into the middle of an instruction* — Watcom's CRT hides
+`mov edi, ecx` inside `test ax, 0xCF89` — which is lifted as its own block that
+jumps back into the main stream.
+
+### Tools added along the way
+
+| env var | effect |
+|---|---|
+| `RECOMP_WATCH=1` | every 2 s: a sampling profile of `g_cur_func`, the last indirect calls, file opens; answers MessageBoxes instead of blocking |
+| `RECOMP_SHOT=<dir>` | dump every 30th presented frame as BMP |
+| `RECOMP_KEYS=ms:vk,...` | scripted key presses after the display mode is set |
+| `RECOMP_BREAK=<va>` | (`RECOMP_TRACE` builds) print the entry history the first time `va` runs |
+| `RECOMP_REACH=va,...` | (`RECOMP_TRACE` builds) report the first entry of each listed function |
+
+`RECOMP_KEYS="5000:13,9000:13"` goes from boot to the Volume 1 intro.

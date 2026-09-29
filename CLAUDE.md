@@ -72,7 +72,24 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   `cmake -S . -B build -G Ninja && cmake --build build`
 - Generated files are gitignored: `src/recomp/gen/`, `src/runtime/imports_gen.c`.
 
-## Bring-up State (Phase 7)
+## Bring-up State (Phase 7) -- IN GAME as of 2026-09-29
+- Boot -> menu -> New Game -> Volume 1 -> intro cinematic works.
+  `RECOMP_KEYS="5000:13,9000:13"` drives it. See docs/PHASE7.md for env vars
+  (RECOMP_WATCH / RECOMP_SHOT / RECOMP_KEYS / RECOMP_BREAK / RECOMP_REACH).
+- **Use the Release build** (`build-rel/`, `-DCMAKE_BUILD_TYPE=Release`, ~3 min
+  full). The unoptimised `build/` is far too slow to play. `build-trace/` is
+  Release + `-DRECOMP_TRACE` for RECOMP_BREAK.
+- DirectDraw = `src/runtime/video.c` (fake COM via host thunks at 0xFFF00000+).
+  Renderer DLL = `src/runtime/renderer.c` on D3D9, spec in docs/RENDERER_API.md.
+  **My sessions have no D3D9 adapter** (GetAdapterCount()==0), so the D3D path
+  is untested; the engine falls back to its software renderer. Only the user's
+  interactive runs exercise renderer.c.
+- run_lift.py seeds extra entries: Watcom init table (XI_START), code pointers in
+  data / push-imm operands (`data_code_pointers`), branches into instruction
+  middles (lifted as hidden blocks). It also deletes stale chunk files.
+- The engine's own log is nothing; `RECOMP_WATCH=1` answers MessageBoxes and logs
+  their text -- fatal asserts show up as MessageBoxA("...File: x.cpp Line: n").
+
 - 95 of 171 imports have real bodies in `src/runtime/shims_impl.c`; the rest log
   once and return 0. Add a name to `HAND_WRITTEN` in gen_imports.py AND write the
   body — the generator fails if one exists without the other.
@@ -159,6 +176,18 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
    universal CPUID probe — so the answer was always "no CPUID", and Nocturne put
    up "This CPU does not have an MMX unit" and quit.
 
+9. `push es`/`pop es` lifted as 2-byte (narrow push/pop work) -- in 32-bit code a
+   segment push moves esp by 4 unless 66h-prefixed. `_stack_bits()` in lift32.
+10. Static flag state leaked across jump targets (linear lift in run_lift.py AND
+   pcrecomp generate.py) -- a `jbe` at a label paired with the textually
+   preceding `and`. Blocked every WM_CHAR. Reset `_flag_state` at branch targets.
+11. Unresolved RECOMP_ICALL did `esp += 4` for a return address it never pushed.
+   Skipped ~90 static constructors (Watcom __InitRtns lost its saved regs).
+12. `add` never set `_cf`; `add eax,eax / adc edx,edx` read a stale carry.
+13. `fild/fistp qword` through a 53-bit double. Now `g_st_i64[]` shadows exact
+   int64 per x87 slot (`fp_push_i64`, `fp_xch`, `fp_st0_to_i64`), header-owned
+   via `__declspec(selectany)` so no project must define it.
+
 Also found: the sibling projects' hand-typed import ARGC table gives
 `waveOutOpen` 7 args; the SDK decoration says 6. Not fixed there — noted as the
 reason this project derives the counts instead.
@@ -170,8 +199,8 @@ reason this project derives the counts instead.
   and alternate-entry scan shared by all lift drivers. `--selftest`.
 - `pcrecomp/runtime/recomp32/crash_report.{c,h}` — crash diagnostics.
 
-## Current Numbers (Phase 7, 2026-09-10)
-- 6,027 lifted functions (5,494 from IDA + 533 recovered), 903,247 lines of C
+## Current Numbers (Phase 7, 2026-09-29)
+- 6,276 lifted functions (5,494 from IDA + 782 recovered), ~965,000 lines of C
 - 171 imports across 8 DLLs (KERNEL32 89, USER32 30, GDI32 14, ADVAPI32 5,
   DSOUND 2 by ordinal, DDRAW 1)
 - 99 original source files / 7 dirs; 88 classes; 266 `Class::method` names
@@ -191,9 +220,9 @@ All three are candidates to upstream into pcrecomp; `pod.py` supersedes
 
 ## Roadmap
 0 recon ✅ · 1 disasm + symbols ✅ · 2 POD reader ✅ · 3 lift to C ✅ ·
-4 shims + BSS ✅ · 5 build & link ✅ · 6 renderer (37-call `APIDLL*` → D3D11) ·
-7 bring-up (CRT, WinMain, real window + message loop, file I/O, engine init;
-    now blocked on the renderer — `wincore\wddvmem.cpp` wants DirectDraw)
+4 shims + BSS ✅ · 5 build & link ✅ · 6 renderer (37-call `APIDLL*` → D3D9,
+written, untested on hardware) · 7 bring-up (menus, New Game, Volume 1 intro ✅;
+next: sound, the intro level proper, the D3D9 path on real hardware)
 
 ## Git Workflow
 - `main` branch only unless told otherwise. Private repo.

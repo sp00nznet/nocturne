@@ -366,8 +366,9 @@ void imp_GlobalMemoryStatus(void) {
         MEM32(p + MS_MEMORY_LOAD)     = 25;             /* percent in use */
         MEM32(p + MS_TOTAL_PHYS)      = PHYS_TOTAL;
         MEM32(p + MS_AVAIL_PHYS)      = PHYS_AVAIL;
-        MEM32(p + MS_TOTAL_PAGEFILE)  = PHYS_TOTAL;
-        MEM32(p + MS_AVAIL_PAGEFILE)  = PHYS_AVAIL;
+        /* The engine warns below 200 MB of free swap; a 1999 answer is fine. */
+        MEM32(p + MS_TOTAL_PAGEFILE)  = 0x40000000u;
+        MEM32(p + MS_AVAIL_PAGEFILE)  = 0x40000000u;
         /* Virtual: report what the arena can actually still hand out, so the
          * engine's own sizing decisions match reality rather than a fiction. */
         MEM32(p + MS_TOTAL_VIRTUAL)   = ARENA_SIZE;
@@ -567,6 +568,9 @@ void imp_CreateFileA(void) {
     const char* name = (const char*)simp(ARG(0));
     HANDLE h = name ? CreateFileA(name, ARG(1), ARG(2), NULL, ARG(4), ARG(5), NULL)
                     : INVALID_HANDLE_VALUE;
+    if (getenv("RECOMP_WATCH"))
+        fprintf(stderr, "[file] open %s%s\n", name ? name : "(null)",
+                h == INVALID_HANDLE_VALUE ? " -- FAILED" : "");
     /* ARG(3) lpSecurityAttributes and ARG(6) hTemplateFile are simulated
      * pointers/handles that cannot be passed through; the engine passes NULL for
      * both, and honouring a non-NULL one would need a real translation. */
@@ -848,6 +852,9 @@ static cur_msg_t g_cur_msg;
 static LRESULT CALLBACK host_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     uint32_t proc = class_proc((ATOM)GetClassLongPtrA(hwnd, GCW_ATOM));
     if (!proc) return DefWindowProcA(hwnd, msg, wp, lp);
+    if (getenv("RECOMP_WATCH_MSGS") && msg != WM_MOUSEMOVE && msg != WM_SETCURSOR &&
+        msg != WM_NCHITTEST && msg != WM_NCMOUSEMOVE)
+        fprintf(stderr, "[wndproc] msg %04X wp %08X lp %08X\n", msg, (unsigned)wp, (unsigned)lp);
 
     /* Saved and restored around the call, so nested dispatches nest correctly. */
     cur_msg_t outer = g_cur_msg;
@@ -1031,6 +1038,12 @@ void imp_FindWindowA(void) {
 }
 
 void imp_MessageBoxA(void) {
+    fprintf(stderr, "[shims] MessageBoxA(\"%s\", \"%s\", %08X)\n",
+            ARG(2) ? (const char*)simp(ARG(2)) : "", ARG(1) ? (const char*)simp(ARG(1)) : "", ARG(3));
+    fflush(stderr);
+    recomp_dump_trace("MessageBoxA");      /* RECOMP_TRACE builds: how we got here */
+    /* RECOMP_WATCH runs are unattended: answer the box instead of blocking. */
+    if (getenv("RECOMP_WATCH")) { RET(IDOK); STDRET(4); return; }
     RET(MessageBoxA(HWND_OF(ARG(0)), (LPCSTR)simp(ARG(1)),
                     (LPCSTR)simp(ARG(2)), ARG(3)));
     STDRET(4);
@@ -1120,7 +1133,37 @@ void imp_mciSendStringA(void)     { RET(MCIERR_INVALID_DEVICE_NAME); STDRET(4); 
  * whatever was on the stack and calling through it. Phase 6 replaces these with
  * the real thing; until then they are honestly absent. */
 void imp_DirectSoundCreate(void) { RET(0x88780078u); STDRET(3); }  /* DSERR_NODRIVER */
-void imp_DirectDrawCreate(void)  { RET(0x80004005u); STDRET(3); }  /* DDERR_GENERIC */
+
+/* DirectDraw and the renderer DLL live in video.c. */
+uint32_t video_ddraw_create(uint32_t out);
+uint32_t video_renderer_proc(const char* name);
+#define RENDERER_HMODULE  0x10000000u   /* what LoadLibraryA("tri*.dll") returns */
+
+void imp_DirectDrawCreate(void) { RET(video_ddraw_create(ARG(1))); STDRET(3); }
+
+/* The only library the engine loads is its renderer (rendererDLLPath in
+ * nocturne.ini). The real DLLs are 32-bit and cannot load into this process;
+ * video.c implements the same APIDLL* interface natively instead. */
+void imp_LoadLibraryA(void) {
+    const char* n = (const char*)simp(ARG(0));
+    const char* base = n ? strrchr(n, '\\') : NULL;
+    base = base ? base + 1 : n;
+    int ok = base && _strnicmp(base, "tri", 3) == 0 && video_renderer_proc("APIDLLinit");
+    fprintf(stderr, "[shims] LoadLibraryA(\"%s\") -> %s\n", n ? n : "(null)",
+            ok ? "native renderer" : "absent");
+    RET(ok ? RENDERER_HMODULE : 0);
+    STDRET(1);
+}
+
+void imp_GetProcAddress(void) {
+    const char* n = (const char*)simp(ARG(1));
+    RET(ARG(0) == RENDERER_HMODULE && ARG(1) > 0xFFFF ? video_renderer_proc(n) : 0);
+    STDRET(2);
+}
+
+/* For video.c, which needs arena memory and the game's window. */
+uint32_t shims_alloc(uint32_t size) { return virt_alloc(0, size); }
+HWND shims_hwnd(uint32_t v) { return HWND_OF(v); }
 
 /* The game asking to exit has to actually exit. A stub that returns lets the
  * caller run on past its own decision to quit -- and everything after that is

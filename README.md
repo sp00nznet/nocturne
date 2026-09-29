@@ -20,13 +20,30 @@ interface the engine already exposes.
 
 ## Status
 
-🟢 **Phase 7 in progress — a real window, real files, and the engine runs as
-far as the renderer.** 6,027 functions lift with 0 errors into a single native
-executable that maps Nocturne's real 42 MB image at `0x00400000` and runs it:
-image mapped at its real VA → IAT installed → lifted `call dword ptr [slot]` →
-dispatch → shim → stdcall-correct return, 95 of the 171 imports with real bodies.
-253 functions carry their **original C++ names** and 522 their **original source
-files**; all 41 POD archives (**12,383 files**) read by `tools/pod.py`.
+🟢 **Phase 7 — in game.** Boot → main menu → New Game → *Volume 1: Dark Reign
+of the Vampire King* → the in-engine intro cinematic, subtitles and all. 6,276
+functions lift with 0 errors into one native x64 executable that maps Nocturne's
+real 42 MB image at `0x00400000` and runs it.
+
+![The Volume 1 intro, running recompiled](docs/img/intro.png)
+
+What it took, since the engine first reached its renderer:
+
+* **DirectDraw** (`src/runtime/video.c`) — the exe draws its 2D into a locked
+  surface itself, so DirectDraw is only a presentation surface: fake COM objects
+  in simulated memory whose vtables are host thunks, presented through GDI.
+* **The renderer DLL** (`src/runtime/renderer.c`) — the 37-call `APIDLL*` API,
+  reverse-engineered from `tridx7.dll` into [docs/RENDERER_API.md](docs/RENDERER_API.md)
+  and reimplemented on Direct3D 9 fixed function. When no D3D9 adapter is
+  available the engine falls back to its own software renderer — which is what
+  the screenshot shows.
+* **Seven toolchain bugs**, all fixed upstream in pcrecomp — among them a 32-bit
+  `push es` lifted as a 2-byte push, `add` never publishing its carry to the
+  following `adc`, static flag state leaking across jump targets (it swallowed
+  every keypress), an unresolved-call path that popped a return address it never
+  pushed (it skipped ~90 C++ static constructors), and `fild/fistp qword` going
+  through a 53-bit double (it moved clipped vertices off-screen). See
+  **[docs/PHASE7.md](docs/PHASE7.md)**.
 
 | Phase | What | State |
 |------:|------|:-----:|
@@ -36,39 +53,10 @@ files**; all 41 POD archives (**12,383 files**) read by `tools/pod.py`.
 | 3 | Lift to C — 6,027 funcs, 903,247 lines, 0 errors, compiles clean | ✅ done |
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
-| 6 | Renderer — implement the 37-call `APIDLL*` interface on D3D11 | ⬜ |
-| 7 | Bring-up — CRT, `WinMain`, real window, real file I/O, engine init | 🟡 in progress |
+| 6 | Renderer — the 37-call `APIDLL*` interface, natively on D3D9 | 🟡 written; hardware path untested |
+| 7 | Bring-up — boot, menus, New Game, the Volume 1 intro | 🟢 in game |
 
-Bring-up now runs the Watcom CRT, `WinMain`, **a real Win32 window with the
-game's own window procedure driving it**, real file I/O, CPU detection, and the
-engine's own allocator — 124,827 indirect calls before it reaches the renderer:
-
-```
-[shims] RegisterClassA("Nocturne") wndproc=sub_00558D90 atom=49915
-[shims] CreateWindowExA("Nocturne", style=80000000) -> 00000000029D0970
-[import-stub] DirectSoundEnumerateA
-[shims] VirtualAlloc(size=1232896) -> 03450000     <- engine pools
-current lifted function: sub_00552E00              <- wincore\wddvmem.cpp
-```
-
-The window is a genuine host window: `RegisterClassA` registers a host class
-whose procedure calls *back into lifted code* with the arguments pushed onto the
-simulated stack, and `PeekMessage`/`DispatchMessage` run the game's real message
-loop. It stops in `wddvmem.cpp` because DirectDraw is not implemented — that is
-Phase 6, so the stopping point is now the renderer rather than a shim.
-
-Getting there turned up a lifting bug worth knowing about: a body whose last
-instruction neither returns nor jumps *falls through* into the next function, and
-the driver was ending those with a bare `return`. That drops the `ret`, so the
-dummy return address is never popped and **four bytes of simulated stack leak per
-call** — 272 sites in this binary. The worst was a two-instruction accessor whose
-`ret` had been catalogued as a separate function because it doubles as the no-op
-heap lock. Fixed upstream. See **[docs/PHASE7.md](docs/PHASE7.md)**, which also
-records three hypotheses that were wrong, and why one crash-time state dump beat
-three build-and-run cycles.
-
-"It runs" means the CRT's opening moves execute correctly. It is not the same as
-playable: every shim is a stub, nothing renders, no POD is mounted. See
+The earlier phases found bugs in the *shared* toolchain too. See
 **[docs/PHASE3.md](docs/PHASE3.md)** and **[docs/PHASE4.md](docs/PHASE4.md)** —
 including the bugs these phases found in the *shared* toolchain, all fixed
 upstream. Four are worth naming:

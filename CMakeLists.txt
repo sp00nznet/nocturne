@@ -32,6 +32,8 @@ add_executable(nocturne_recomp
   src/runtime/imports_gen.c
   src/runtime/recomp_runtime.c
   src/runtime/shims_impl.c
+  src/runtime/video.c
+  src/runtime/renderer.c
   "${PCRECOMP}/runtime/recomp32/image_loader.c"
   "${PCRECOMP}/runtime/recomp32/crash_report.c"
 )
@@ -67,4 +69,4 @@ if(MSVC)
   target_compile_options(nocturne_recomp PRIVATE /MP /W1)
 endif()
 
-target_link_libraries(nocturne_recomp PRIVATE kernel32 user32 gdi32 winmm)
+target_link_libraries(nocturne_recomp PRIVATE kernel32 user32 gdi32 winmm d3d9)

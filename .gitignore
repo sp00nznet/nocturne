@@ -28,6 +28,7 @@ src/recomp/gen/
 
 # --- Build output ---
 build/
+build-*/
 *.o
 *.obj
 *.a

@@ -43,6 +43,7 @@ ptrdiff_t g_mem_base = 0;      /* 1:1 mapping -- see the note above */
 
 uint32_t g_cur_func = 0;
 uint32_t g_icall_trace[ICALL_TRACE_SIZE] = {0};
+uint32_t g_icall_from[ICALL_TRACE_SIZE] = {0};
 uint32_t g_icall_trace_idx = 0;
 uint32_t g_icall_count = 0;
 
@@ -80,9 +81,46 @@ uint32_t shims_make_tib(uint32_t stack_base, uint32_t stack_top);
 /* Declared in recomp_types.h, defined per project. Nothing extra to dump unless
  * the build enabled the per-function entry tracer. */
 #ifdef RECOMP_TRACE
+/* RECOMP_BREAK=<hex va>: the first time that function is entered, print the
+ * entries that led there (from a deeper ring than the header's), run-length
+ * collapsed. A breakpoint for "what ran just before the engine gave up". */
+#define BREAK_RING 16384u
+static uint32_t g_break_ring[BREAK_RING];
+static uint32_t g_break_va = 0xFFFFFFFFu;
+
 void recomp_trace_enter(uint32_t va) {
     g_enter_trace[g_enter_idx & (RECOMP_ENTER_SIZE - 1)] = va;
+    g_break_ring[g_enter_idx & (BREAK_RING - 1)] = va;
     g_enter_idx++;
+    if (g_break_va == 0xFFFFFFFFu) {
+        const char* b = getenv("RECOMP_BREAK");
+        g_break_va = b ? (uint32_t)strtoul(b, NULL, 16) : 0;
+    }
+    /* RECOMP_REACH=va,va,...: report the first entry of each listed function. */
+    static uint32_t reach[512]; static int nreach = -1;
+    if (nreach < 0) {
+        nreach = 0;
+        for (const char* r = getenv("RECOMP_REACH"); r && *r && nreach < 512; ) {
+            reach[nreach++] = (uint32_t)strtoul(r, (char**)&r, 16);
+            if (*r == ',') r++;
+        }
+    }
+    for (int i = 0; i < nreach; i++)
+        if (reach[i] == va) {
+            fprintf(stderr, "[reach] %08X #%u\n", va, g_enter_idx);
+            reach[i] = 0;
+        }
+    if (va != g_break_va || !va) return;
+    g_break_va = 0;                             /* once */
+    fprintf(stderr, "[break] sub_%08X reached; preceding entries:\n", va);
+    uint32_t prev = 0, run = 0, n = g_enter_idx < BREAK_RING ? g_enter_idx : BREAK_RING;
+    for (uint32_t i = g_enter_idx - n; i != g_enter_idx; i++) {
+        uint32_t f = g_break_ring[i & (BREAK_RING - 1)];
+        if (f == prev) { run++; continue; }
+        if (prev) fprintf(stderr, run > 1 ? " %08X*%u" : " %08X", prev, run);
+        prev = f; run = 1;
+    }
+    fprintf(stderr, " %08X\n", prev);
 }
 #endif
 
@@ -191,11 +229,34 @@ recomp_func_t recomp_lookup(uint32_t va) {
     return NULL;
 }
 
-/* Hand-installed overrides, for bisecting a bad lift during bring-up: point one
- * VA at a hand-written body without regenerating anything. Empty by design. */
+/* Host thunks: VAs at the top of the 32-bit space that name host C functions.
+ * COM vtables and GetProcAddress results hand these to lifted code, which calls
+ * through them like any other function pointer. Nothing is mapped up here, so a
+ * thunk VA can never collide with image, stack or heap.
+ *
+ * g_host_thunk_id is the index of the thunk being called, set on lookup: that is
+ * how one host function can serve a whole vtable (it is read immediately, before
+ * anything else can do a lookup). */
+#define HOST_THUNK_BASE  0xFFF00000u
+#define HOST_THUNK_MAX   1024u
+static recomp_func_t g_host_thunks[HOST_THUNK_MAX];
+static uint32_t g_host_thunk_n = 0;
+uint32_t g_host_thunk_id = 0;
+
+uint32_t recomp_host_thunk(recomp_func_t f) {
+    if (g_host_thunk_n >= HOST_THUNK_MAX) {
+        fprintf(stderr, "[runtime] host thunk table full\n");
+        abort();
+    }
+    g_host_thunks[g_host_thunk_n] = f;
+    return HOST_THUNK_BASE + 4u * g_host_thunk_n++;
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t va) {
-    (void)va;
-    return NULL;
+    uint32_t i = (va - HOST_THUNK_BASE) / 4u;
+    if (va < HOST_THUNK_BASE || i >= g_host_thunk_n) return NULL;
+    g_host_thunk_id = i;
+    return g_host_thunks[i];
 }
 
 /* Import bridges. The table is small (171) and generated in IAT order, which is
@@ -221,6 +282,45 @@ void nocturne_install_iat(void) {
  * ============================================================ */
 
 #define NOCTURNE_ENTRY  0x00567152u   /* PE entry point (Watcom CRT startup) */
+
+/* RECOMP_WATCH=1: every 2 s, say where lifted code is. A hang or a spin loop
+ * prints nothing on its own; this names the function it is spinning in and the
+ * indirect calls it keeps making. Racy reads of plain globals, by design. */
+static DWORD WINAPI watchdog(LPVOID unused) {
+    (void)unused;
+    /* Also a poor man's sampling profiler: g_cur_func every millisecond, the
+     * top entries printed with each report. A loop shows up as its members. */
+    enum { NS = 4096 };
+    static uint32_t key[NS], cnt[NS];
+    for (;;) {
+        memset(key, 0, sizeof(key)); memset(cnt, 0, sizeof(cnt));
+        for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 2000; ) {
+            Sleep(1);
+            uint32_t f = g_cur_func, h = (f * 2654435761u) % NS;
+            while (key[h] && key[h] != f) h = (h + 1) % NS;
+            key[h] = f; cnt[h]++;
+        }
+        fprintf(stderr, "[watch] top:");
+        for (int k = 0; k < 12; k++) {
+            uint32_t best = 0;
+            for (uint32_t i = 1; i < NS; i++) if (cnt[i] > cnt[best]) best = i;
+            if (!cnt[best]) break;
+            fprintf(stderr, " %08X:%u", key[best], cnt[best]);
+            cnt[best] = 0;
+        }
+        fprintf(stderr, "\n");
+        uint32_t n = g_icall_trace_idx;
+        /* Key ring head/tail, the game's main hwnd, and its quit flag: what
+         * the engine's blocking getKey() (0x558B00) spins on. */
+        fprintf(stderr, "[watch] keyring %u/%u hwnd %08X quit %u\n", MEM32(0x2DE0848u),
+                MEM32(0x2DE084Cu), MEM32(0x2DE2098u), MEM32(0x2DE20A0u));
+        fprintf(stderr, "[watch] in sub_%08X, %u icalls; last:", g_cur_func, g_icall_count);
+        for (int i = 1; i <= 6; i++)
+            fprintf(stderr, " %08X<-%08X", g_icall_trace[(n - i) & (ICALL_TRACE_SIZE - 1)],
+                    g_icall_from[(n - i) & (ICALL_TRACE_SIZE - 1)]);
+        fprintf(stderr, "\n");
+    }
+}
 
 int main(int argc, char** argv) {
     const char* image = (argc > 1) ? argv[1] : "nocturne.exe";
@@ -262,6 +362,8 @@ int main(int argc, char** argv) {
                 NOCTURNE_ENTRY);
         return 1;
     }
+
+    if (getenv("RECOMP_WATCH")) CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
 
     PUSH32(g_esp, RECOMP_RETADDR);
     entry();

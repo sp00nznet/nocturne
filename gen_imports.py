@@ -74,6 +74,8 @@ HAND_WRITTEN = {
     # Devices with no implementation yet: they report absent, not success
     'waveOutGetDevCapsA', 'waveOutOpen', 'joyGetDevCapsA', 'joyGetPos',
     'mciSendStringA', 'DirectSoundCreate', 'DirectDrawCreate',
+    # The renderer DLL, reimplemented natively in video.c
+    'LoadLibraryA', 'GetProcAddress',
     # Exit really exits
     'ExitProcess',
 }
