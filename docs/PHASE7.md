@@ -315,4 +315,18 @@ jumps back into the main stream.
 | `RECOMP_BREAK=<va>` | (`RECOMP_TRACE` builds) print the entry history the first time `va` runs |
 | `RECOMP_REACH=va,...` | (`RECOMP_TRACE` builds) report the first entry of each listed function |
 
-`RECOMP_KEYS="5000:13,9000:13"` goes from boot to the Volume 1 intro.
+`RECOMP_KEYS` entries are `ms:vk[:holdms]`. From boot to walking the Stranger
+around the HQ (Enter ×3, then Esc → Down ×6 → Enter picks "Skip cinematic", then
+W held for 4 s):
+
+```
+RECOMP_KEYS=3000:13,6000:13,9000:13,25000:27,27000:40,28000:40,29000:40,30000:40,31000:40,32000:40,34000:13,42000:87:4000
+```
+
+Timings drift with load speed; check the `RECOMP_SHOT` frames. Two things the
+key script has to do that a person does without thinking: hold keys for ~300 ms
+(a press and release inside one slow software frame is never seen, because the
+engine polls held-state bytes that the next pump clears), and send
+`WM_ACTIVATEAPP` first (the engine sleeps and ignores input while inactive, and
+an unattended run is rarely the foreground window). `RECOMP_SOFTWARE=1` refuses
+the D3D9 mode so the engine uses its software renderer on any machine.

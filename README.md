@@ -21,11 +21,13 @@ interface the engine already exposes.
 ## Status
 
 🟢 **Phase 7 — in game.** Boot → main menu → New Game → *Volume 1: Dark Reign
-of the Vampire King* → the in-engine intro cinematic, subtitles and all. 6,276
+of the Vampire King* → the in-engine intro cinematic → **the Stranger under player
+control in the Spookhouse HQ**, the first playable scene. 6,276
 functions lift with 0 errors into one native x64 executable that maps Nocturne's
 real 42 MB image at `0x00400000` and runs it.
 
 ![The Volume 1 intro, running recompiled](docs/img/intro.png)
+![Walking the Stranger through the Spookhouse HQ](docs/img/gameplay.png)
 
 What it took, since the engine first reached its renderer:
 
@@ -54,7 +56,7 @@ What it took, since the engine first reached its renderer:
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
 | 6 | Renderer — the 37-call `APIDLL*` interface, natively on D3D9 | 🟡 written; hardware path untested |
-| 7 | Bring-up — boot, menus, New Game, the Volume 1 intro | 🟢 in game |
+| 7 | Bring-up — boot, menus, New Game, the Volume 1 intro, player control | 🟢 in game |
 
 The earlier phases found bugs in the *shared* toolchain too. See
 **[docs/PHASE3.md](docs/PHASE3.md)** and **[docs/PHASE4.md](docs/PHASE4.md)** —

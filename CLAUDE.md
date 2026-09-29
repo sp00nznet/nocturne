@@ -73,8 +73,9 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
 - Generated files are gitignored: `src/recomp/gen/`, `src/runtime/imports_gen.c`.
 
 ## Bring-up State (Phase 7) -- IN GAME as of 2026-09-29
-- Boot -> menu -> New Game -> Volume 1 -> intro cinematic works.
-  `RECOMP_KEYS="5000:13,9000:13"` drives it. See docs/PHASE7.md for env vars
+- Boot -> menu -> New Game -> Volume 1 -> intro cinematic -> player control in the
+  HQ works. Full key script is in docs/PHASE7.md (Esc, Down x6, Enter = skip
+  cinematic; keys need ~300 ms holds and WM_ACTIVATEAPP, both in video.c). See docs/PHASE7.md for env vars
   (RECOMP_WATCH / RECOMP_SHOT / RECOMP_KEYS / RECOMP_BREAK / RECOMP_REACH).
 - **Use the Release build** (`build-rel/`, `-DCMAKE_BUILD_TYPE=Release`, ~3 min
   full). The unoptimised `build/` is far too slow to play. `build-trace/` is

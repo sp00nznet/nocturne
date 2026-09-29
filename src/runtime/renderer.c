@@ -306,6 +306,12 @@ static void drop_device(void) {
 static void clear_texture_cache(void);
 
 static int make_device(uint32_t w, uint32_t h) {
+    /* RECOMP_SOFTWARE=1: refuse the mode, as a machine without 3D would, and
+     * the engine falls back to its own software renderer. */
+    if (getenv("RECOMP_SOFTWARE")) {
+        fprintf(stderr, "[renderer] RECOMP_SOFTWARE set: declining %ux%u\n", w, h);
+        return 0;
+    }
     if (!R.d3d) R.d3d = Direct3DCreate9(D3D_SDK_VERSION);
     if (!R.d3d) { fprintf(stderr, "[renderer] Direct3DCreate9 failed\n"); return 0; }
     clear_texture_cache();

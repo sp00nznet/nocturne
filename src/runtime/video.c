@@ -233,22 +233,25 @@ static void present(obj_t* s) {
     ReleaseDC(g_dd.hwnd, dc);
 }
 
-/* RECOMP_KEYS="ms:vk,ms:vk,...": post key presses to the game window at those
+/* RECOMP_KEYS="ms:vk[:hold],...": post key presses to the game window at those
  * times after it gets its display mode -- scripted input for driving menus
  * from a run with no desktop, e.g. "3000:13,6000:13" presses Enter twice. */
 static DWORD WINAPI key_script(LPVOID hwnd) {
     const char* p = getenv("RECOMP_KEYS");
     DWORD t0 = GetTickCount();
     while (p && *p) {
-        unsigned ms = 0, vk = 0;
-        if (sscanf(p, "%u:%u", &ms, &vk) != 2) break;
+        unsigned ms = 0, vk = 0, hold = 300;      /* longer than a slow software frame */
+        if (sscanf(p, "%u:%u:%u", &ms, &vk, &hold) < 2) break;
         while (GetTickCount() - t0 < ms) Sleep(10);
         UINT sc = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
         if ((vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT || vk == VK_DELETE)
             sc |= 0x100;                /* extended: the engine keys on lParam>>16 & 0x1FF */
         fprintf(stderr, "[keys] vk %u\n", vk);
+        /* The engine idles and ignores input while inactive, and an unattended
+         * run is rarely the foreground window: tell it it is active. */
+        PostMessageA((HWND)hwnd, WM_ACTIVATEAPP, TRUE, 0);
         PostMessageA((HWND)hwnd, WM_KEYDOWN, vk, 1 | (sc << 16));
-        Sleep(80);
+        Sleep(hold);
         PostMessageA((HWND)hwnd, WM_KEYUP, vk, 1 | (sc << 16) | 0xC0000000u);
         p = strchr(p, ',');
         if (p) p++;
