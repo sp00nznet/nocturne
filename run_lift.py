@@ -21,7 +21,8 @@ import glob
 import sys, os, json, time, re, shutil
 
 _here = os.path.dirname(os.path.abspath(__file__))
-_pcroot = os.path.join(_here, '..', 'tools')
+# PCRECOMP overrides the sibling checkout (the shared one moves between branches).
+_pcroot = os.environ.get('PCRECOMP') or os.path.join(_here, '..', 'tools')
 _pc = os.path.join(_pcroot, 'tools')
 sys.path.insert(0, os.path.join(_pc, 'pe'))
 sys.path.insert(0, os.path.join(_pc, 'lift'))

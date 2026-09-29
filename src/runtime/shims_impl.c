@@ -861,6 +861,9 @@ static LRESULT CALLBACK host_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     g_cur_msg.hwnd = hwnd; g_cur_msg.msg = msg; g_cur_msg.lp = lp;
     /* h_put, not h_ptr: WM_NCCREATE and WM_CREATE arrive before CreateWindowExA
      * has returned, so this is where the window first gets a 32-bit identity. */
+    /* A scripted run is rarely the foreground window, and the engine idles and
+     * drops input while it believes it is inactive: never tell it so. */
+    if (msg == WM_ACTIVATEAPP && getenv("RECOMP_KEYS")) wp = TRUE;
     uint32_t args[4] = { h_put(hwnd), msg, (uint32_t)wp, (uint32_t)lp };
     uint32_t r = call_lifted(proc, 4, args);
     g_cur_msg = outer;

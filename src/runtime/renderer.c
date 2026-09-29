@@ -552,9 +552,36 @@ API(APIDLLsetVideoMode) {
     DONE(make_device(640, 480));
 }
 
+/* RECOMP_SHOT=<dir>: every 30th presented frame as a BMP, like video.c does
+ * for the DirectDraw path. */
+static void shot(void) {
+    static int n = 0;
+    const char* dir = getenv("RECOMP_SHOT");
+    if (!dir || n++ % 30) return;
+    D3DLOCKED_RECT lr;
+    if (FAILED(IDirect3DDevice9_GetRenderTargetData(R.dev, R.back, R.sysmem)) ||
+        FAILED(IDirect3DSurface9_LockRect(R.sysmem, &lr, NULL, D3DLOCK_READONLY)))
+        return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\d3d_%05d.bmp", dir, n - 1);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        BITMAPINFOHEADER bh = { sizeof(bh), (LONG)R.w, -(LONG)R.h, 1, 32, BI_RGB };
+        uint32_t img = R.w * 4 * R.h;
+        BITMAPFILEHEADER fh = { 0x4D42, 14 + sizeof(bh) + img, 0, 0, 14 + sizeof(bh) };
+        fwrite(&fh, 14, 1, f);
+        fwrite(&bh, sizeof(bh), 1, f);
+        for (uint32_t y = 0; y < R.h; y++)
+            fwrite((uint8_t*)lr.pBits + y * (uint32_t)lr.Pitch, R.w * 4, 1, f);
+        fclose(f);
+    }
+    IDirect3DSurface9_UnlockRect(R.sysmem);
+}
+
 API(APIDLLtoggle) {
     if (R.dev && !R.locked) {
         flush();
+        shot();
         IDirect3DDevice9_Present(R.dev, NULL, NULL, NULL, NULL);
     }
     DONE(1);

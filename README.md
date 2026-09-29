@@ -28,6 +28,7 @@ real 42 MB image at `0x00400000` and runs it.
 
 ![The Volume 1 intro, running recompiled](docs/img/intro.png)
 ![Walking the Stranger through the Spookhouse HQ](docs/img/gameplay.png)
+![The same scene through the native D3D9 renderer](docs/img/intro_d3d9.png)
 
 What it took, since the engine first reached its renderer:
 
@@ -36,9 +37,10 @@ What it took, since the engine first reached its renderer:
   in simulated memory whose vtables are host thunks, presented through GDI.
 * **The renderer DLL** (`src/runtime/renderer.c`) — the 37-call `APIDLL*` API,
   reverse-engineered from `tridx7.dll` into [docs/RENDERER_API.md](docs/RENDERER_API.md)
-  and reimplemented on Direct3D 9 fixed function. When no D3D9 adapter is
-  available the engine falls back to its own software renderer — which is what
-  the screenshot shows.
+  and reimplemented on Direct3D 9 fixed function. It renders the intro and the
+  HQ (textures, fog, depth, the 2D subtitle overlay through frame locking). With
+  no D3D9 adapter — or `RECOMP_SOFTWARE=1` — the engine falls back to its own
+  software renderer, which is what the first screenshot shows.
 * **Seven toolchain bugs**, all fixed upstream in pcrecomp — among them a 32-bit
   `push es` lifted as a 2-byte push, `add` never publishing its carry to the
   following `adc`, static flag state leaking across jump targets (it swallowed
@@ -55,7 +57,7 @@ What it took, since the engine first reached its renderer:
 | 3 | Lift to C — 6,027 funcs, 903,247 lines, 0 errors, compiles clean | ✅ done |
 | 4 | Shim layer — 171 derived import bridges, 42 MB BSS image, first execution | ✅ done |
 | 5 | Build & link — one native exe, CMake + Ninja | ✅ done |
-| 6 | Renderer — the 37-call `APIDLL*` interface, natively on D3D9 | 🟡 written; hardware path untested |
+| 6 | Renderer — the 37-call `APIDLL*` interface, natively on D3D9 | 🟢 renders the intro and HQ |
 | 7 | Bring-up — boot, menus, New Game, the Volume 1 intro, player control | 🟢 in game |
 
 The earlier phases found bugs in the *shared* toolchain too. See

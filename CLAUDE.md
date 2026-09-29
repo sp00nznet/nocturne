@@ -82,9 +82,13 @@ Watcom-built `nocturne.exe` (v1.01, 1999-11-02) to C for native Windows 11.
   Release + `-DRECOMP_TRACE` for RECOMP_BREAK.
 - DirectDraw = `src/runtime/video.c` (fake COM via host thunks at 0xFFF00000+).
   Renderer DLL = `src/runtime/renderer.c` on D3D9, spec in docs/RENDERER_API.md.
-  **My sessions have no D3D9 adapter** (GetAdapterCount()==0), so the D3D path
-  is untested; the engine falls back to its software renderer. Only the user's
-  interactive runs exercise renderer.c.
+  D3D9 path VERIFIED 2026-09-29 (intro + HQ render correctly). Whether my session
+  sees an adapter varies (GetAdapterCount()==0 early on, later 1); with none the
+  engine falls back to software. RECOMP_SHOT dumps both paths (d3d_*.bmp for D3D9).
+- pcrecomp: build against my worktree G:/recomp/pc/pcrecomp-nocturne-fix
+  (branch fix/lift32-nocturne-correctness, PR #9) via `PCRECOMP=<path>` for
+  run_lift.py and `-DPCRECOMP=<path>` for CMake. The shared ../tools checkout is
+  another session's branch -- do not commit there.
 - run_lift.py seeds extra entries: Watcom init table (XI_START), code pointers in
   data / push-imm operands (`data_code_pointers`), branches into instruction
   middles (lifted as hidden blocks). It also deletes stale chunk files.
